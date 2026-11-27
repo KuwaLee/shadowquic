@@ -56,6 +56,8 @@ pub struct SQServerConn<C: QuicConnection> {
     pub inner: SQConn<C>,
     pub users: SunnyQuicUsers,
     pub user_manager: Option<Arc<dyn UserManager>>,
+    /// Ignore the download rate clients request through Brutal negotiation.
+    pub ignore_client_bandwidth: bool,
 }
 impl<C: QuicConnection> SQServerConn<C> {
     pub async fn handle_connection(
@@ -237,7 +239,13 @@ impl<C: QuicConnection> SQServerConn<C> {
                 self.handle_user_extension(user_opcode, &mut send).await?;
             }
             SQExtOpcode::MihomoBrutal(request) => {
-                super::brutal::handle_negotiation(&self.inner.conn, request, &mut send).await?;
+                super::brutal::handle_negotiation(
+                    &self.inner.conn,
+                    request,
+                    self.ignore_client_bandwidth,
+                    &mut send,
+                )
+                .await?;
             }
         }
         Ok(())

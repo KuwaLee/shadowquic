@@ -6,12 +6,13 @@ use shadowquic::config::{
     AuthUser, BrutalParams, CongestionControl, JlsUpstream, ShadowQuicClientCfg,
     ShadowQuicServerCfg, default_initial_mtu,
 };
+use shadowquic::quic::BrutalSendMode;
 use shadowquic::shadowquic::{inbound::ShadowQuicServer, outbound::ShadowQuicClient};
 use shadowquic::squic::{brutal::negotiate, outbound::get_peer_conn_stats};
 
 const MBIT: u64 = 1_000_000;
 
-fn brutal(up: u64, down: Option<u64>) -> CongestionControl {
+fn brutal(up: Option<u64>, down: Option<u64>) -> CongestionControl {
     CongestionControl::Brutal(BrutalParams {
         bandwidth: up,
         down,
@@ -19,7 +20,11 @@ fn brutal(up: u64, down: Option<u64>) -> CongestionControl {
     })
 }
 
-async fn start_server(port: u16, congestion_control: CongestionControl) {
+async fn start_server(
+    port: u16,
+    congestion_control: CongestionControl,
+    ignore_client_bandwidth: bool,
+) {
     let server = ShadowQuicServer::new(ShadowQuicServerCfg {
         bind_addr: format!("127.0.0.1:{port}").parse().unwrap(),
         users: vec![AuthUser {
@@ -33,6 +38,7 @@ async fn start_server(port: u16, congestion_control: CongestionControl) {
         alpn: vec!["h3".into()],
         initial_mtu: default_initial_mtu(),
         congestion_control,
+        ignore_client_bandwidth,
         ..Default::default()
     })
     .await
@@ -58,50 +64,67 @@ fn client(port: u16, congestion_control: CongestionControl) -> ShadowQuicClient 
     )
 }
 
-#[tokio::test]
-async fn client_upload_is_capped_by_server_down() {
-    start_server(4493, brutal(100 * MBIT, Some(20 * MBIT))).await;
-    let conn = client(4493, brutal(50 * MBIT, Some(200 * MBIT)))
+async fn negotiated_upload(
+    port: u16,
+    server_cc: CongestionControl,
+    ignore_client_bandwidth: bool,
+    client_cc: CongestionControl,
+) -> Option<BrutalSendMode> {
+    start_server(port, server_cc, ignore_client_bandwidth).await;
+    let conn = client(port, client_cc)
         .get_conn()
         .await
         .expect("failed to connect");
-
-    let rate = negotiate(&conn).await.expect("negotiation failed");
-    assert_eq!(rate, Some(20 * MBIT));
-}
-
-#[tokio::test]
-async fn client_keeps_upload_when_server_reports_no_down() {
-    start_server(4494, brutal(100 * MBIT, None)).await;
-    let conn = client(4494, brutal(50 * MBIT, Some(200 * MBIT)))
-        .get_conn()
-        .await
-        .expect("failed to connect");
-
-    let rate = negotiate(&conn).await.expect("negotiation failed");
-    assert_eq!(rate, None);
-}
-
-#[tokio::test]
-async fn negotiation_fails_without_breaking_connection_when_server_is_not_brutal() {
-    start_server(4495, CongestionControl::Bbr).await;
-    let conn = client(4495, brutal(50 * MBIT, Some(200 * MBIT)))
-        .get_conn()
-        .await
-        .expect("failed to connect");
-
-    assert!(negotiate(&conn).await.is_err());
+    let mode = negotiate(&conn).await.expect("negotiation failed");
     let stats = get_peer_conn_stats(&conn).await.expect("connection broken");
     assert!(stats.is_ok());
+    mode
 }
 
 #[tokio::test]
-async fn client_without_down_does_not_negotiate() {
-    start_server(4496, brutal(100 * MBIT, Some(20 * MBIT))).await;
-    let conn = client(4496, brutal(50 * MBIT, None))
-        .get_conn()
-        .await
-        .expect("failed to connect");
+async fn client_upload_is_capped_by_server_down() {
+    let mode = negotiated_upload(
+        4493,
+        brutal(Some(100 * MBIT), Some(20 * MBIT)),
+        false,
+        brutal(Some(50 * MBIT), Some(200 * MBIT)),
+    )
+    .await;
+    assert_eq!(mode, Some(BrutalSendMode::Brutal(20 * MBIT)));
+}
 
-    assert_eq!(negotiate(&conn).await.expect("unexpected error"), None);
+#[tokio::test]
+async fn server_without_rates_lets_client_use_its_bandwidth() {
+    let mode = negotiated_upload(
+        4494,
+        CongestionControl::Bbr,
+        false,
+        brutal(Some(50 * MBIT), Some(200 * MBIT)),
+    )
+    .await;
+    assert_eq!(mode, Some(BrutalSendMode::Brutal(50 * MBIT)));
+}
+
+#[tokio::test]
+async fn server_ignoring_client_bandwidth_sends_client_to_base() {
+    let mode = negotiated_upload(
+        4495,
+        brutal(Some(100 * MBIT), Some(20 * MBIT)),
+        true,
+        brutal(Some(50 * MBIT), Some(200 * MBIT)),
+    )
+    .await;
+    assert_eq!(mode, Some(BrutalSendMode::Base));
+}
+
+#[tokio::test]
+async fn client_without_brutal_rates_does_not_negotiate() {
+    let mode = negotiated_upload(
+        4496,
+        brutal(Some(100 * MBIT), Some(20 * MBIT)),
+        false,
+        CongestionControl::Bbr,
+    )
+    .await;
+    assert_eq!(mode, None);
 }

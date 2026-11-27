@@ -68,25 +68,36 @@ pub trait QuicConnection: Send + Sync + Clone + 'static {
         None
     }
     /// Brutal rates configured on this connection's congestion controller,
-    /// or `None` when the connection does not use an adjustable Brutal.
+    /// or `None` when the connection cannot negotiate Brutal.
     fn brutal_rates(&self) -> Option<BrutalRates> {
         None
     }
-    /// Overrides the Brutal send rate, in bits per second, of this
-    /// connection. Returns `false` when the connection does not use an
-    /// adjustable Brutal controller.
-    fn set_brutal_send_rate(&self, _bps: u64) -> bool {
+    /// Changes how this connection sends. Returns `false` when the
+    /// connection cannot negotiate Brutal.
+    fn set_brutal_send_mode(&self, _mode: BrutalSendMode) -> bool {
         false
     }
 }
 
-/// Brutal rates of one connection, in bits per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Brutal rates configured on one connection, in bits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BrutalRates {
-    /// Configured send rate.
-    pub up: u64,
-    /// Configured receive rate, exchanged with the peer during negotiation.
+    /// Send rate. `None` means no limit: the configured congestion control
+    /// is used until the peer reports a receive rate.
+    pub up: Option<u64>,
+    /// Receive rate, exchanged with the peer during negotiation.
     pub down: Option<u64>,
+}
+
+/// How a connection sends after Brutal negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrutalSendMode {
+    /// Brutal at the configured `up` rate, or the base controller without it.
+    Configured,
+    /// The base congestion controller, ignoring the configured `up` rate.
+    Base,
+    /// Brutal at this rate in bits per second.
+    Brutal(u64),
 }
 
 impl<T: QuicConnection> Stoppable for T {

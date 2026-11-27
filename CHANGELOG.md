@@ -9,10 +9,20 @@ Version links compare each release with the preceding tag.
 
 ### Added
 
-- mihomo-compatible Brutal bandwidth negotiation for ShadowQUIC. Set `down`
-  under `congestion-control.brutal` on a client to request a download rate
-  from mihomo or ShadowQUIC servers. ShadowQUIC servers with Brutal now accept
-  negotiation from mihomo clients using `up`/`down`.
+- mihomo-compatible Brutal bandwidth negotiation for ShadowQUIC, following
+  Hysteria2's semantics. Set `down` under `congestion-control.brutal` on a
+  client to request a download rate; the server reports its own `down` to cap
+  the client's upload. Works with mihomo clients using `up`/`down`.
+- `ignore-client-bandwidth` on ShadowQUIC servers makes both sides of a
+  negotiated connection use BBR, like Hysteria2's `ignoreClientBandwidth`.
+
+### Changed
+
+- ShadowQUIC servers negotiate Brutal with any `congestion-control`: a server
+  without `bandwidth` sends at the client's requested rate without a limit.
+- For ShadowQUIC, `bandwidth` under `congestion-control.brutal` is optional and
+  no longer defaults to 10000000; without it the connection uses BBR until
+  negotiation provides a rate. SunnyQUIC keeps the old default.
 
 ## [0.4.14](https://github.com/spongebob888/shadowquic/compare/v0.4.13...v0.4.14) - 2026-11-26
 

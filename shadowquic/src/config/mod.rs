@@ -1080,24 +1080,29 @@ pub fn default_brutal_ack_compensate() -> bool {
 /// ```yaml
 /// congestion-control:
 ///   brutal:
-///     bandwidth: 10000000 # default 10000000 bps
-///     down: 50m # optional
+///     bandwidth: 100m # optional, send rate
+///     down: 200m # optional, receive rate
 /// ```
-/// For Brutal, `bandwidth` is the sending bandwidth: the upload of a client, the
-/// download of its clients for a server. Values are in bits per second; `k`, `m`
-/// and `g` suffixes are accepted.
+/// Values are in bits per second; `k`, `m` and `g` suffixes are accepted.
+/// `bandwidth` is the sending rate: the upload of a client, the download of its
+/// clients for a server. `down` is the receiving rate.
 ///
-/// `down` enables Brutal bandwidth negotiation, compatible with mihomo's ShadowQUIC
-/// `up`/`down`:
-/// - On a client, `down` is the download rate requested from the server. The
-///   server sends at `min(down, server bandwidth)`, and the client uploads at
-///   `min(server down, bandwidth)`. Without `down` the client does not negotiate.
-/// - On a server, `down` is the receive rate reported to clients to cap their
-///   upload. A server with Brutal answers negotiation requests even without
-///   `down`; then clients keep their own `bandwidth`.
+/// ShadowQUIC negotiates Brutal with the peer, compatible with mihomo's
+/// ShadowQUIC `up`/`down` and following Hysteria2's semantics. Each side decides
+/// how it sends:
+/// - The client sends `down` to the server. The server sends with Brutal at that
+///   rate, capped by its `bandwidth` when set. A client without `down` gets BBR.
+/// - The server answers with its `down`. The client sends with Brutal at
+///   `min(server down, bandwidth)`, or at `bandwidth` when the server has no
+///   `down`. A client without `bandwidth` uses BBR.
+/// - With `ignore-client-bandwidth` on the server, both sides use BBR.
 ///
-/// If the peer does not support negotiation, the configured `bandwidth` is kept.
-/// Negotiation is only implemented for ShadowQUIC; SunnyQUIC ignores `down`.
+/// Servers negotiate with any `congestion-control`, which is used whenever
+/// Brutal is not; with `brutal` that is BBR. A server without `bandwidth` has
+/// no limit, like Hysteria2. Clients negotiate when `bandwidth` or `down` is
+/// set; if the server does not support it, the configured rate is kept.
+/// SunnyQUIC does not negotiate; it ignores `down` and defaults `bandwidth` to
+/// 10000000.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub enum CongestionControl {
@@ -2135,7 +2140,7 @@ outbounds:
         let cfg: Result<ShadowQuicClientCfg, _> = serde_saphyr::from_str(cfgstr);
         match cfg.unwrap().congestion_control {
             CongestionControl::Brutal(params) => {
-                assert_eq!(params.bandwidth, 1000);
+                assert_eq!(params.bandwidth, Some(1000));
                 assert_eq!(params.down, Some(2048));
             }
             _ => panic!("expected brutal congestion control"),
