@@ -1081,10 +1081,23 @@ pub fn default_brutal_ack_compensate() -> bool {
 /// congestion-control:
 ///   brutal:
 ///     bandwidth: 10000000 # default 10000000 bps
+///     down: 50m # optional
 /// ```
-/// For Brutal, the bandwidth is the uploading bandwidth.
-/// If you want to
-/// set the downloading bandwidth,  set the bandwidth of the peer(e.g. it's the server for the client)
+/// For Brutal, `bandwidth` is the sending bandwidth: the upload of a client, the
+/// download of its clients for a server. Values are in bits per second; `k`, `m`
+/// and `g` suffixes are accepted.
+///
+/// `down` enables Brutal bandwidth negotiation, compatible with mihomo's ShadowQUIC
+/// `up`/`down`:
+/// - On a client, `down` is the download rate requested from the server. The
+///   server sends at `min(down, server bandwidth)`, and the client uploads at
+///   `min(server down, bandwidth)`. Without `down` the client does not negotiate.
+/// - On a server, `down` is the receive rate reported to clients to cap their
+///   upload. A server with Brutal answers negotiation requests even without
+///   `down`; then clients keep their own `bandwidth`.
+///
+/// If the peer does not support negotiation, the configured `bandwidth` is kept.
+/// Negotiation is only implemented for ShadowQUIC; SunnyQUIC ignores `down`.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub enum CongestionControl {
@@ -2116,12 +2129,14 @@ outbounds:
         congestion-control: 
             brutal:
                 bandwidth: 1000
+                down: 2k
 
 "###;
         let cfg: Result<ShadowQuicClientCfg, _> = serde_saphyr::from_str(cfgstr);
         match cfg.unwrap().congestion_control {
             CongestionControl::Brutal(params) => {
                 assert_eq!(params.bandwidth, 1000);
+                assert_eq!(params.down, Some(2048));
             }
             _ => panic!("expected brutal congestion control"),
         }

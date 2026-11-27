@@ -99,6 +99,21 @@ impl ShadowQuicClient {
             }
             .in_current_span(),
         );
+        let conn_clone = conn.clone();
+        task.spawn(
+            async move {
+                if let Err(error) = crate::squic::brutal::negotiate(&conn_clone).await {
+                    // The server does not support the extension; keep the configured rate.
+                    tracing::debug!(
+                        event = "recovery:brutal_negotiation_failed",
+                        %error,
+                        "brutal negotiation failed, keeping configured send rate"
+                    );
+                }
+                Ok(())
+            }
+            .in_current_span(),
+        );
         let port_hopping = &self.config.port_hopping;
         let _conn_clone = conn.clone();
         if port_hopping.enable {

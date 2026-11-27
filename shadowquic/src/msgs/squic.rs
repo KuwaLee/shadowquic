@@ -7,7 +7,7 @@ use super::socks5::SocksAddr;
 use super::{SDecode, SEncode};
 use crate::config::AuthUser;
 use shadowquic_macros::{SDecode, SEncode};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub static SUNNY_QUIC_AUTH_LEN: usize = 64;
 pub(crate) type SunnyCredential = Arc<[u8; SUNNY_QUIC_AUTH_LEN]>;
@@ -51,6 +51,78 @@ pub enum SQExtOpcode {
     Conn(ExtOpcodeConn) = 0x1,
     /// User related opcode
     User(ExtOpcodeUser) = 0x2,
+    /// mihomo private Brutal bandwidth negotiation: ASCII "mihomo" + id 1.
+    MihomoBrutal(BrutalNegotiation) = EXT_OPCODE_MIHOMO_BRUTAL,
+}
+
+/// Opcode of the mihomo private Brutal negotiation extension.
+pub const EXT_OPCODE_MIHOMO_BRUTAL: u64 = 0x6d69686f6d6f0001;
+
+const BRUTAL_NEGOTIATION_VERSION: u8 = 1;
+const BRUTAL_NEGOTIATION_MIN_PAYLOAD_LEN: u16 = 8;
+const BRUTAL_NEGOTIATION_MAX_PAYLOAD_LEN: u16 = 64;
+/// Response flag: the server did not get a client rate and uses automatic
+/// congestion control.
+pub const BRUTAL_NEGOTIATION_FLAG_RX_AUTO: u8 = 1 << 0;
+
+/// Frame of the mihomo Brutal negotiation, used for both the request body and
+/// the response:
+///
+/// `version(1) | flags(1) | payload length(2) | payload`
+///
+/// Version 1 defines the first 8 payload bytes as `rx`, the desired receive
+/// bandwidth in bytes per second (0 = unknown/auto). Unknown flags and trailing
+/// payload bytes are ignored so the frame can be extended.
+#[derive(PartialEq, Debug, Clone, Copy, Default)]
+pub struct BrutalNegotiation {
+    pub flags: u8,
+    /// Receive bandwidth in bytes per second, 0 for unknown/auto.
+    pub rx: u64,
+}
+
+impl BrutalNegotiation {
+    pub fn rx_auto(&self) -> bool {
+        self.flags & BRUTAL_NEGOTIATION_FLAG_RX_AUTO != 0
+    }
+}
+
+#[async_trait::async_trait]
+impl SEncode for BrutalNegotiation {
+    async fn encode<W: AsyncWrite + Unpin + Send>(&self, s: &mut W) -> SResult<()> {
+        let mut buf = [0u8; 12];
+        buf[0] = BRUTAL_NEGOTIATION_VERSION;
+        buf[1] = self.flags;
+        buf[2..4].copy_from_slice(&BRUTAL_NEGOTIATION_MIN_PAYLOAD_LEN.to_be_bytes());
+        buf[4..12].copy_from_slice(&self.rx.to_be_bytes());
+        s.write_all(&buf).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SDecode for BrutalNegotiation {
+    async fn decode<R: AsyncRead + Unpin + Send>(s: &mut R) -> SResult<Self> {
+        let mut header = [0u8; 4];
+        s.read_exact(&mut header).await?;
+        if header[0] != BRUTAL_NEGOTIATION_VERSION {
+            return Err(SError::ProtocolViolation);
+        }
+        let payload_len = u16::from_be_bytes([header[2], header[3]]);
+        if !(BRUTAL_NEGOTIATION_MIN_PAYLOAD_LEN..=BRUTAL_NEGOTIATION_MAX_PAYLOAD_LEN)
+            .contains(&payload_len)
+        {
+            return Err(SError::ProtocolViolation);
+        }
+        let mut payload = [0u8; BRUTAL_NEGOTIATION_MAX_PAYLOAD_LEN as usize];
+        let payload = &mut payload[..payload_len as usize];
+        s.read_exact(payload).await?;
+        let mut rx = [0u8; 8];
+        rx.copy_from_slice(&payload[..8]);
+        Ok(Self {
+            flags: header[1],
+            rx: u64::from_be_bytes(rx),
+        })
+    }
 }
 #[derive(PartialEq)]
 #[repr(u8)]
@@ -123,6 +195,68 @@ pub struct SQPacketStreamHeader {
 #[derive(SEncode, SDecode, Clone)]
 pub struct SQPacketDatagramHeader {
     pub id: u16, // id is one to one coresponance a udpsocket and proxy dst
+}
+
+#[tokio::test]
+async fn test_mihomo_brutal_request_wire_format() {
+    let req = SQReq::SQExtension(SQExtOpcode::MihomoBrutal(BrutalNegotiation {
+        flags: 0,
+        rx: 12_500_000,
+    }));
+    let mut buf = Vec::new();
+    req.encode(&mut buf).await.unwrap();
+    let mut expected = vec![0xff];
+    expected.extend_from_slice(&0x6d69686f6d6f0001u64.to_be_bytes());
+    expected.extend_from_slice(&[1, 0, 0, 8]);
+    expected.extend_from_slice(&12_500_000u64.to_be_bytes());
+    assert_eq!(buf, expected);
+
+    let mut cursor = std::io::Cursor::new(buf);
+    let decoded = SQReq::decode(&mut cursor).await.unwrap();
+    assert!(decoded == req);
+}
+
+#[tokio::test]
+async fn test_brutal_negotiation_ignores_trailing_payload_and_flags() {
+    let mut buf = vec![1, 0x81, 0, 10];
+    buf.extend_from_slice(&42u64.to_be_bytes());
+    buf.extend_from_slice(&[0xaa, 0xbb]);
+    let decoded = BrutalNegotiation::decode(&mut std::io::Cursor::new(buf))
+        .await
+        .unwrap();
+    assert_eq!(decoded.rx, 42);
+    assert!(decoded.rx_auto());
+}
+
+#[tokio::test]
+async fn test_brutal_negotiation_rejects_bad_frames() {
+    // Unsupported version.
+    let mut buf = vec![2, 0, 0, 8];
+    buf.extend_from_slice(&0u64.to_be_bytes());
+    assert!(
+        BrutalNegotiation::decode(&mut std::io::Cursor::new(buf))
+            .await
+            .is_err()
+    );
+    // Payload too short.
+    let buf = vec![1, 0, 0, 4, 0, 0, 0, 0];
+    assert!(
+        BrutalNegotiation::decode(&mut std::io::Cursor::new(buf))
+            .await
+            .is_err()
+    );
+    // A NotAvailable extension error is not a valid response.
+    let mut buf = Vec::new();
+    Err::<(), SQExtError>(SQExtError::NotAvailable)
+        .encode(&mut buf)
+        .await
+        .unwrap();
+    assert_eq!(buf, [0x01, 0x00]);
+    assert!(
+        BrutalNegotiation::decode(&mut std::io::Cursor::new(buf))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

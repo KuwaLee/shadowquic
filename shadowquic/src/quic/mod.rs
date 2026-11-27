@@ -67,6 +67,26 @@ pub trait QuicConnection: Send + Sync + Clone + 'static {
     fn get_conn_stats(&self) -> Option<ConnStats> {
         None
     }
+    /// Brutal rates configured on this connection's congestion controller,
+    /// or `None` when the connection does not use an adjustable Brutal.
+    fn brutal_rates(&self) -> Option<BrutalRates> {
+        None
+    }
+    /// Overrides the Brutal send rate, in bits per second, of this
+    /// connection. Returns `false` when the connection does not use an
+    /// adjustable Brutal controller.
+    fn set_brutal_send_rate(&self, _bps: u64) -> bool {
+        false
+    }
+}
+
+/// Brutal rates of one connection, in bits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrutalRates {
+    /// Configured send rate.
+    pub up: u64,
+    /// Configured receive rate, exchanged with the peer during negotiation.
+    pub down: Option<u64>,
 }
 
 impl<T: QuicConnection> Stoppable for T {

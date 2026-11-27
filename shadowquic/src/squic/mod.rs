@@ -36,6 +36,7 @@ use crate::{
     quic::QuicConnection,
 };
 
+pub mod brutal;
 pub mod inbound;
 pub mod outbound;
 

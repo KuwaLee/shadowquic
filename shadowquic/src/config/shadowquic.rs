@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DurationMs, deserialize_bps};
+use super::{DurationMs, deserialize_bps, deserialize_opt_bps};
 use crate::config::{
     AuthUser, CipherSuitePreference, CongestionControl, HasCipherSuitePreference, SocketOpt,
     default_alpn, default_blackhole_detection, default_blackhole_threshold,
@@ -238,8 +238,22 @@ impl Default for ShadowQuicClientCfg {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct BrutalParams {
+    /// Sending bandwidth in bits per second (upload for clients, download
+    /// for clients of a server).
     #[serde(deserialize_with = "deserialize_bps")]
     pub bandwidth: u64,
+    /// Receiving bandwidth in bits per second, negotiated with the peer
+    /// through the mihomo Brutal extension.
+    ///
+    /// On a client it is the download rate requested from the server, and
+    /// the negotiation only starts when it is set. On a server it is the
+    /// receive rate reported to clients, which they use to cap their upload.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_bps",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub down: Option<u64>,
     pub min_window: u64,
     pub cwnd_gain: f64,
     pub min_ack_rate: f64,
@@ -251,6 +265,7 @@ impl Default for BrutalParams {
     fn default() -> Self {
         Self {
             bandwidth: default_brutal_bandwidth(),
+            down: None,
             min_window: default_brutal_min_window(),
             cwnd_gain: default_brutal_cwnd_gain(),
             min_ack_rate: default_brutal_min_ack_rate(),

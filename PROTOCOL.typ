@@ -333,6 +333,7 @@ In order to provide flexiblity, we define `0xFF` to be _customized extensions_. 
 Here is the list of supported subcommands
 - `Conn(0x1)`: connection subcommand, used to deal with per connection operation.
 - `User(0x2)`: user managerment subcommand, used to deal with per user operation.
+- `MihomoBrutal(0x6d69686f6d6f0001)`: Brutal bandwidth negotiation, compatible with mihomo's private extension (ASCII `mihomo` + id 1).
 
 === `Conn` Subcommand
 `Conn` subcommand can accept one byte parameter, Here 0x0 means GetConnStats. The stream will return QUIC connection stats in this bistream.
@@ -574,3 +575,28 @@ Here is the serialized bytes stream of response
 )
 
 All integers and `f64` values are encoded in network byte order.
+
+=== `MihomoBrutal` Subcommand
+`MihomoBrutal` negotiates Brutal send rates in both directions and is wire compatible with mihomo. The client opens a bistream right after the connection is established and sends the request without blocking other commands. All integers are big endian.
+
+#protocol-table(
+  (1fr, 1fr, 1fr, 1fr, 1fr, 1fr),
+  [*`CMD(0xff)`*],
+  [*`OPCODE`*],
+  [*`VERSION(0x1)`*],
+  [*`FLAGS`*],
+  [*`LEN`*],
+  [*`RX`*],
+  [1],
+  [8],
+  [1],
+  [1],
+  [2],
+  [`LEN`],
+)
+
+`RX` is the first 8 bytes of the payload: the receive bandwidth the client wants, in *bytes* per second, `0` meaning unknown. `LEN` is between 8 and 64; readers ignore unknown `FLAGS` bits and payload bytes after `RX`, so fields can be appended later.
+
+On success the server sends at `min(client RX, server upload)` and responds with the same frame without `CMD` and `OPCODE`, carrying its own receive bandwidth in `RX` (`0` when not configured). `FLAGS` bit `0x1` (`RX_AUTO`) means the server uses automatic congestion control; the client then keeps its own congestion control. Otherwise, when `RX` is not zero, the client sends at `min(server RX, client upload)`.
+
+A server that cannot negotiate responds with ```rust Err(SQExtError::NotAvailable)```, i.e. `0x01 0x00`. Since it is shorter than the 4-byte frame header, the client treats it like any other failure and keeps its configured congestion control.
