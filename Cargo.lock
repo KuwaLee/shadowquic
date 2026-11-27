@@ -2860,8 +2860,7 @@ dependencies = [
 [[package]]
 name = "quinn-jls"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea00596eb53fa6f29899b0e48014ff4804bcfeda4aae5a228df25b9b64e315cf"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=fix%2Fstop-sending#dbfff3baf0ecd8c2fd64b615edefa4cb294e24f2"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2880,8 +2879,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto-jls"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "383da615650985c5b656c7a9b6642bf74c27003e02f9aaac917ce8e81eb791e4"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=fix%2Fstop-sending#dbfff3baf0ecd8c2fd64b615edefa4cb294e24f2"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2903,8 +2901,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp-jls"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5749a7be268ab1c4fb36b2d6011bffb2c692a7d668c0116663289aa2e91b6d"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=fix%2Fstop-sending#dbfff3baf0ecd8c2fd64b615edefa4cb294e24f2"
 dependencies = [
  "cfg_aliases",
  "libc",

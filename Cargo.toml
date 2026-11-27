@@ -23,3 +23,11 @@ panic = "unwind"
 strip = true
 
 [workspace.dependencies]
+
+# quinn-jls 0.4.0 can deadlock a connection when the peer stops a stream while
+# the connection-level write limit is zero. Use a quinn-jls build synced with
+# upstream quinn main (quinn-rs/quinn#2834) until a fixed release is published.
+[patch.crates-io]
+quinn-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "fix/stop-sending" }
+quinn-proto-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "fix/stop-sending" }
+quinn-udp-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "fix/stop-sending" }
