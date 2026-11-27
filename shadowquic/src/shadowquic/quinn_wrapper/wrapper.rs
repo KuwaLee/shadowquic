@@ -37,8 +37,9 @@ use quinn::rustls::crypto::ring as crypto_provider;
 
 use crate::{
     config::{
-        CipherSuitePreference, CongestionControl, ShadowQuicClientCfg, ShadowQuicServerCfg,
-        maybe_warn_cipher_suite_on_weak_arch, normalize_cipher_suite_preference,
+        BrutalParams, CipherSuitePreference, CongestionControl, ShadowQuicClientCfg,
+        ShadowQuicServerCfg, maybe_warn_cipher_suite_on_weak_arch,
+        normalize_cipher_suite_preference,
     },
     error::SResult,
     msgs::squic::ConnStats,
@@ -400,23 +401,37 @@ fn negotiable_controller(congestion_control: &CongestionControl) -> NegotiableCo
             Arc::new(BbrConfig::default())
         }
     };
-    let CongestionControl::Brutal(brutal) = congestion_control else {
-        return NegotiableConfig::new(base, BrutalConfigCore::default(), None, None);
+    // Without `brutal`, a negotiated Brutal still uses ShadowQUIC's
+    // defaults, not brutal-core's (whose `cwnd_gain` is 1.25).
+    let default_params = BrutalParams::default();
+    let brutal = match congestion_control {
+        CongestionControl::Brutal(brutal) => {
+            info!(
+                event = "recovery:controller_selected",
+                ?brutal,
+                "using brutal congestion control"
+            );
+            brutal
+        }
+        _ => &default_params,
     };
-    info!(
-        event = "recovery:controller_selected",
-        ?brutal,
-        "using brutal congestion control"
-    );
-    let core = BrutalConfigCore::new(
+    NegotiableConfig::new(
+        base,
+        brutal_config_core(brutal),
+        brutal.bandwidth,
+        brutal.down,
+    )
+}
+
+fn brutal_config_core(brutal: &BrutalParams) -> BrutalConfigCore {
+    BrutalConfigCore::new(
         brutal.bandwidth.unwrap_or_default(),
         brutal.min_window,
         brutal.cwnd_gain,
         brutal.min_ack_rate,
         brutal.min_sample_count,
         brutal.ack_compensate,
-    );
-    NegotiableConfig::new(base, core, brutal.bandwidth, brutal.down)
+    )
 }
 
 fn bind_server_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -606,5 +621,18 @@ impl From<quinn::ConnectError> for QuicErrorRepr {
 impl From<quinn::SendDatagramError> for QuicErrorRepr {
     fn from(value: quinn::SendDatagramError) -> Self {
         QuicErrorRepr::QuicSendDatagramError(format!("{}", value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::default_brutal_cwnd_gain;
+
+    #[test]
+    fn negotiated_brutal_without_params_uses_shadowquic_defaults() {
+        let core = brutal_config_core(&BrutalParams::default());
+        assert_eq!(core.cwnd_gain, default_brutal_cwnd_gain());
+        assert_ne!(core.cwnd_gain, BrutalConfigCore::default().cwnd_gain);
     }
 }

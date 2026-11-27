@@ -24,6 +24,17 @@ Version links compare each release with the preceding tag.
   no longer defaults to 10000000; without it the connection uses BBR until
   negotiation provides a rate. SunnyQUIC keeps the old default.
 
+### Fixed
+
+- ShadowQUIC Brutal no longer fills the bottleneck queue when its rate exceeds
+  the path capacity. The window now follows RTT samples capped at twice the
+  windowed minimum RTT, with a periodic PROBE_RTT to drain the queue. In a test
+  at 1.6x a 20 Mbit/s bottleneck, loaded latency rose by about 60 ms instead of
+  1.8 s, with the same throughput.
+- Brutal negotiated on a server without `brutal` parameters uses ShadowQUIC's
+  defaults (`cwnd-gain` 1.1) instead of brutal-core's 1.25, which sent well
+  above the requested rate.
+
 ## [0.4.14](https://github.com/spongebob888/shadowquic/compare/v0.4.13...v0.4.14) - 2026-11-26
 
 ### Added
