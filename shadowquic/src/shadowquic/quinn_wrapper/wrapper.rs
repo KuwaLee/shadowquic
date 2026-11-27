@@ -10,7 +10,7 @@ use std::{
 };
 use tracing::Instrument;
 
-use super::brutal::BrutalConfig;
+use super::brutal::{Brutal, BrutalConfig};
 use async_trait::async_trait;
 use bytes::Bytes;
 use quinn::rustls::{
@@ -42,7 +42,8 @@ use crate::{
     error::SResult,
     msgs::squic::ConnStats,
     quic::{
-        AuthedConn, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection, QuicErrorRepr, QuicServer,
+        AuthedConn, BrutalRates, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection, QuicErrorRepr,
+        QuicServer,
     },
     utils::socket_opt::{SocketFactory, UdpSocketFactory},
 };
@@ -149,6 +150,26 @@ impl QuicConnection for Connection {
             rtt: self.rtt().as_secs_f64() * 1000.0,
             current_mtu: stats.path.current_mtu,
         })
+    }
+    fn brutal_rates(&self) -> Option<BrutalRates> {
+        let brutal = self
+            .congestion_state()
+            .into_any()
+            .downcast::<Brutal>()
+            .ok()?;
+        Some(BrutalRates {
+            up: brutal.configured_up_bps(),
+            down: brutal.configured_down_bps(),
+        })
+    }
+    fn set_brutal_send_rate(&self, bps: u64) -> bool {
+        match self.congestion_state().into_any().downcast::<Brutal>() {
+            Ok(brutal) => {
+                brutal.set_send_rate(bps);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -381,7 +402,8 @@ pub fn gen_client_cfg(cfg: &ShadowQuicClientCfg) -> quinn::ClientConfig {
                 brutal.min_ack_rate,
                 brutal.min_sample_count,
                 brutal.ack_compensate,
-            );
+            )
+            .with_down(brutal.down);
             tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
         }
     };
@@ -561,7 +583,8 @@ fn gen_server_config(
                 brutal.min_ack_rate,
                 brutal.min_sample_count,
                 brutal.ack_compensate,
-            );
+            )
+            .with_down(brutal.down);
             tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
         }
         CongestionControl::Bbr => {

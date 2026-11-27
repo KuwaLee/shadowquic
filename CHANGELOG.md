@@ -5,6 +5,15 @@ Git tags and commits; dates are the dates of the tagged commits. Routine version
 bumps, formatting, and dependency updates are omitted unless they affect behavior.
 Version links compare each release with the preceding tag.
 
+## Unreleased
+
+### Added
+
+- mihomo-compatible Brutal bandwidth negotiation for ShadowQUIC. Set `down`
+  under `congestion-control.brutal` on a client to request a download rate
+  from mihomo or ShadowQUIC servers. ShadowQUIC servers with Brutal now accept
+  negotiation from mihomo clients using `up`/`down`.
+
 ## [0.4.14](https://github.com/spongebob888/shadowquic/compare/v0.4.13...v0.4.14) - 2026-11-26
 
 ### Added

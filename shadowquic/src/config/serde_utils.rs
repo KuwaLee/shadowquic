@@ -199,6 +199,13 @@ where
     deserializer.deserialize_any(BpsVisitor)
 }
 
+pub fn deserialize_opt_bps<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bps(deserializer).map(Some)
+}
+
 /// A whole-number duration. Bare values and `ms` use milliseconds, `s` uses seconds,
 /// and `min` uses minutes.
 /// `LB` is the inclusive minimum in milliseconds and the default value.

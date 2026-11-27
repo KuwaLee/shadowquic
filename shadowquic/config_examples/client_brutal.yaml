@@ -13,7 +13,8 @@ outbounds:
     initial-mtu: 1300
     congestion-control: 
        brutal:
-          bandwidth: 100m
+          bandwidth: 100m # upload
+          down: 200m # optional, download requested from the server (mihomo-compatible negotiation)
     zero-rtt: true
     gso: true # Enable Quinn Generic Segmentation Offload (GSO)
     over-stream: false  # true for udp over stream, false for udp over datagram

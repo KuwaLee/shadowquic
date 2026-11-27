@@ -236,6 +236,9 @@ impl<C: QuicConnection> SQServerConn<C> {
             SQExtOpcode::User(user_opcode) => {
                 self.handle_user_extension(user_opcode, &mut send).await?;
             }
+            SQExtOpcode::MihomoBrutal(request) => {
+                super::brutal::handle_negotiation(&self.inner.conn, request, &mut send).await?;
+            }
         }
         Ok(())
     }
