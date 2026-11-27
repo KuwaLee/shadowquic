@@ -255,6 +255,7 @@ impl SunnyQuicServer {
             inner: SQConn::new(incom, SetOnce::new()),
             users: user_hash,
             user_manager: Some(user_manager),
+            ignore_client_bandwidth: false,
         };
         let span = tracing::Span::current();
         span.record(

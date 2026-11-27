@@ -2,17 +2,17 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DurationMs, deserialize_bps, deserialize_opt_bps};
+use super::{DurationMs, deserialize_opt_bps};
 use crate::config::{
     AuthUser, CipherSuitePreference, CongestionControl, HasCipherSuitePreference, SocketOpt,
     default_alpn, default_blackhole_detection, default_blackhole_threshold,
-    default_brutal_ack_compensate, default_brutal_bandwidth, default_brutal_cwnd_gain,
-    default_brutal_min_ack_rate, default_brutal_min_sample_count, default_brutal_min_window,
-    default_congestion_control, default_gso, default_half_close_timeout,
-    default_inbound_max_streams, default_initial_mtu, default_keep_alive_interval, default_min_mtu,
-    default_mtu_discovery, default_outbound_max_streams, default_over_stream,
-    default_port_hopping_enable, default_port_hopping_interval, default_port_hopping_jitter,
-    default_store_flush_interval, default_stream_receive_window, default_zero_rtt,
+    default_brutal_ack_compensate, default_brutal_cwnd_gain, default_brutal_min_ack_rate,
+    default_brutal_min_sample_count, default_brutal_min_window, default_congestion_control,
+    default_gso, default_half_close_timeout, default_inbound_max_streams, default_initial_mtu,
+    default_keep_alive_interval, default_min_mtu, default_mtu_discovery,
+    default_outbound_max_streams, default_over_stream, default_port_hopping_enable,
+    default_port_hopping_interval, default_port_hopping_jitter, default_store_flush_interval,
+    default_stream_receive_window, default_zero_rtt,
 };
 
 pub fn default_rate_limit() -> u64 {
@@ -69,6 +69,14 @@ pub struct ShadowQuicServerCfg {
     /// Congestion control, default to "bbr", supported: "bbr", "new-reno", "cubic"
     #[serde(default = "default_congestion_control")]
     pub congestion_control: CongestionControl,
+    /// Ignore the download rate clients request through Brutal negotiation,
+    /// like Hysteria2's `ignoreClientBandwidth`.
+    ///
+    /// The server then keeps its own congestion control and reports its
+    /// Brutal `down` to clients, or tells them to use automatic congestion
+    /// control when `down` is not set. Default to false.
+    #[serde(default)]
+    pub ignore_client_bandwidth: bool,
     /// Initial mtu, must be larger than min mtu, at least to be 1200.
     /// 1400 is recommended for high packet loss network. default to be 1300
     #[serde(default = "default_initial_mtu")]
@@ -180,6 +188,7 @@ impl Default for ShadowQuicServerCfg {
             alpn: Default::default(),
             zero_rtt: Default::default(),
             congestion_control: Default::default(),
+            ignore_client_bandwidth: false,
             initial_mtu: default_initial_mtu(),
             min_mtu: default_min_mtu(),
             server_name: None,
@@ -240,8 +249,16 @@ impl Default for ShadowQuicClientCfg {
 pub struct BrutalParams {
     /// Sending bandwidth in bits per second (upload for clients, download
     /// for clients of a server).
-    #[serde(deserialize_with = "deserialize_bps")]
-    pub bandwidth: u64,
+    ///
+    /// ShadowQUIC: when omitted, the connection uses BBR until the peer
+    /// reports its receive rate through negotiation, which then becomes the
+    /// Brutal send rate without a cap. SunnyQUIC: defaults to 10000000.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_bps",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bandwidth: Option<u64>,
     /// Receiving bandwidth in bits per second, negotiated with the peer
     /// through the mihomo Brutal extension.
     ///
@@ -264,7 +281,7 @@ pub struct BrutalParams {
 impl Default for BrutalParams {
     fn default() -> Self {
         Self {
-            bandwidth: default_brutal_bandwidth(),
+            bandwidth: None,
             down: None,
             min_window: default_brutal_min_window(),
             cwnd_gain: default_brutal_cwnd_gain(),

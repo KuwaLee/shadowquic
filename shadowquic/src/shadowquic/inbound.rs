@@ -236,6 +236,7 @@ impl ShadowQuicServer {
         incom: C,
         req_sender: Sender<ProxyRequest>,
         user_manager: Arc<dyn UserManager>,
+        ignore_client_bandwidth: bool,
     ) -> Result<(), SError> {
         let user = incom
             .authed_user()
@@ -244,6 +245,7 @@ impl ShadowQuicServer {
             inner: SQConn::new(incom, SetOnce::new_with(Some(Ok(user.clone())))),
             users: Arc::new(Default::default()),
             user_manager: Some(user_manager),
+            ignore_client_bandwidth,
         };
         let span = tracing::Span::current();
         span.record(
@@ -305,9 +307,16 @@ impl Inbound for ShadowQuicServer {
                         );
                         tokio::spawn(
                             async move {
-                                Self::handle_incoming(conn, request_sender, user_manager)
-                                    .await
-                                    .map_err(|x| error!(event = "proxy:connection_failed", "{}", x))
+                                let ignore_client_bandwidth =
+                                    user_manager.config.read().await.ignore_client_bandwidth;
+                                Self::handle_incoming(
+                                    conn,
+                                    request_sender,
+                                    user_manager,
+                                    ignore_client_bandwidth,
+                                )
+                                .await
+                                .map_err(|x| error!(event = "proxy:connection_failed", "{}", x))
                             }
                             .instrument(span),
                         );

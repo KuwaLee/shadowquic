@@ -14,8 +14,9 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::brutal::{Brutal, BrutalConfig};
+use super::brutal::{Negotiable, NegotiableConfig};
 use async_trait::async_trait;
+use brutal_core::BrutalConfigCore;
 use bytes::Bytes;
 use quinn::rustls::{
     RootCertStore,
@@ -23,7 +24,7 @@ use quinn::rustls::{
 };
 use quinn::{
     ClientConfig, MtuDiscoveryConfig, SendDatagramError, TransportConfig, VarInt,
-    congestion::{BbrConfig, CubicConfig, NewRenoConfig},
+    congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{debug, error, info, trace, warn};
@@ -46,7 +47,7 @@ use crate::{
     error::SResult,
     msgs::squic::ConnStats,
     quic::{
-        AuthedConn, BrutalRates, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection,
+        AuthedConn, BrutalRates, BrutalSendMode, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection,
         QuicErrorRepr::{self, QuicEndpointClosed},
         QuicServer,
     },
@@ -162,17 +163,17 @@ impl QuicConnection for Connection {
         let brutal = self
             .congestion_state()
             .into_any()
-            .downcast::<Brutal>()
+            .downcast::<Negotiable>()
             .ok()?;
         Some(BrutalRates {
             up: brutal.configured_up_bps(),
             down: brutal.configured_down_bps(),
         })
     }
-    fn set_brutal_send_rate(&self, bps: u64) -> bool {
-        match self.congestion_state().into_any().downcast::<Brutal>() {
-            Ok(brutal) => {
-                brutal.set_send_rate(bps);
+    fn set_brutal_send_mode(&self, mode: BrutalSendMode) -> bool {
+        match self.congestion_state().into_any().downcast::<Negotiable>() {
+            Ok(controller) => {
+                controller.set_send_mode(mode);
                 true
             }
             Err(_) => false,
@@ -379,47 +380,50 @@ pub fn gen_client_cfg(cfg: &ShadowQuicClientCfg) -> quinn::ClientConfig {
         None
     });
 
-    match cfg.congestion_control {
-        CongestionControl::Cubic => {
-            tp_cfg.congestion_controller_factory(Arc::new(CubicConfig::default()))
-        }
-        CongestionControl::NewReno => {
-            tp_cfg.congestion_controller_factory(Arc::new(NewRenoConfig::default()))
-        }
-        CongestionControl::Bbr => {
-            tp_cfg.congestion_controller_factory(Arc::new(BbrConfig::default()))
-        }
-        CongestionControl::Bbr3 => {
-            warn!(
-                event = "recovery:controller_fallback",
-                "BBR3 is not implemented yet in client, fallback to BBR"
-            );
-            tp_cfg.congestion_controller_factory(Arc::new(BbrConfig::default()))
-        }
-        CongestionControl::Brutal(ref brutal) => {
-            tracing::info!(
-                event = "recovery:controller_selected",
-                ?brutal,
-                "using brutal congestion control"
-            );
-            let brutal_config = BrutalConfig::new(
-                brutal.bandwidth,
-                brutal.min_window,
-                brutal.cwnd_gain,
-                brutal.min_ack_rate,
-                brutal.min_sample_count,
-                brutal.ack_compensate,
-            )
-            .with_down(brutal.down);
-            tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
-        }
-    };
+    tp_cfg.congestion_controller_factory(Arc::new(negotiable_controller(&cfg.congestion_control)));
     let mut config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("rustls config can't created"),
     ));
 
     config.transport_config(Arc::new(tp_cfg));
     config
+}
+
+/// Builds the congestion controller factory of ShadowQUIC connections.
+///
+/// Every connection can switch to Brutal through negotiation. With
+/// `brutal`, the base controller is BBR and the connection starts with Brutal
+/// when `bandwidth` is set.
+fn negotiable_controller(congestion_control: &CongestionControl) -> NegotiableConfig {
+    let base: Arc<dyn ControllerFactory + Send + Sync> = match congestion_control {
+        CongestionControl::Cubic => Arc::new(CubicConfig::default()),
+        CongestionControl::NewReno => Arc::new(NewRenoConfig::default()),
+        CongestionControl::Bbr | CongestionControl::Brutal(_) => Arc::new(BbrConfig::default()),
+        CongestionControl::Bbr3 => {
+            warn!(
+                event = "recovery:controller_fallback",
+                "BBR3 is not implemented yet, fallback to BBR"
+            );
+            Arc::new(BbrConfig::default())
+        }
+    };
+    let CongestionControl::Brutal(brutal) = congestion_control else {
+        return NegotiableConfig::new(base, BrutalConfigCore::default(), None, None);
+    };
+    info!(
+        event = "recovery:controller_selected",
+        ?brutal,
+        "using brutal congestion control"
+    );
+    let core = BrutalConfigCore::new(
+        brutal.bandwidth.unwrap_or_default(),
+        brutal.min_window,
+        brutal.cwnd_gain,
+        brutal.min_ack_rate,
+        brutal.min_sample_count,
+        brutal.ack_compensate,
+    );
+    NegotiableConfig::new(base, core, brutal.bandwidth, brutal.down)
 }
 
 fn bind_server_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -609,43 +613,7 @@ fn gen_server_config(
         );
     }
 
-    match cfg.congestion_control {
-        CongestionControl::Brutal(ref brutal) => {
-            tracing::info!(
-                event = "recovery:controller_selected",
-                ?brutal,
-                "using brutal congestion control"
-            );
-            let brutal_config = BrutalConfig::new(
-                brutal.bandwidth,
-                brutal.min_window,
-                brutal.cwnd_gain,
-                brutal.min_ack_rate,
-                brutal.min_sample_count,
-                brutal.ack_compensate,
-            )
-            .with_down(brutal.down);
-            tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
-        }
-        CongestionControl::Bbr => {
-            tp_cfg.congestion_controller_factory(Arc::new(BbrConfig::default()))
-        }
-        CongestionControl::Bbr3 => {
-            warn!(
-                event = "recovery:controller_fallback",
-                "BBR3 is not implemented yet in client, fallback to BBR"
-            );
-            tp_cfg.congestion_controller_factory(Arc::new(BbrConfig::default()))
-        }
-        CongestionControl::Cubic => {
-            let cubic_config = CubicConfig::default();
-            tp_cfg.congestion_controller_factory(Arc::new(cubic_config))
-        }
-        CongestionControl::NewReno => {
-            let new_reno = NewRenoConfig::default();
-            tp_cfg.congestion_controller_factory(Arc::new(new_reno))
-        }
-    };
+    tp_cfg.congestion_controller_factory(Arc::new(negotiable_controller(&cfg.congestion_control)));
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(crypto.clone()).expect("rustls config can't created"),
     ));

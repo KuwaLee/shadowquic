@@ -428,7 +428,9 @@ pub fn gen_client_cfg(cfg: &SunnyQuicClientCfg) -> noq::ClientConfig {
                 "using brutal congestion control"
             );
             let brutal_config = BrutalConfig::new(
-                brutal.bandwidth,
+                brutal
+                    .bandwidth
+                    .unwrap_or_else(crate::config::default_brutal_bandwidth),
                 brutal.min_window,
                 brutal.cwnd_gain,
                 brutal.min_ack_rate,
@@ -590,7 +592,9 @@ fn gen_server_config(
                 "using brutal congestion control"
             );
             let brutal_config = BrutalConfig::new(
-                brutal.bandwidth,
+                brutal
+                    .bandwidth
+                    .unwrap_or_else(crate::config::default_brutal_bandwidth),
                 brutal.min_window,
                 brutal.cwnd_gain,
                 brutal.min_ack_rate,

@@ -597,6 +597,8 @@ All integers and `f64` values are encoded in network byte order.
 
 `RX` is the first 8 bytes of the payload: the receive bandwidth the client wants, in *bytes* per second, `0` meaning unknown. `LEN` is between 8 and 64; readers ignore unknown `FLAGS` bits and payload bytes after `RX`, so fields can be appended later.
 
-On success the server sends at `min(client RX, server upload)` and responds with the same frame without `CMD` and `OPCODE`, carrying its own receive bandwidth in `RX` (`0` when not configured). `FLAGS` bit `0x1` (`RX_AUTO`) means the server uses automatic congestion control; the client then keeps its own congestion control. Otherwise, when `RX` is not zero, the client sends at `min(server RX, client upload)`.
+Each side decides how it sends, following Hysteria2's semantics:
+- Server: when it ignores client bandwidth, it keeps its own congestion control and responds with `FLAGS` bit `0x1` (`RX_AUTO`). Otherwise it sends with Brutal at the client `RX`, capped by its upload limit when it has one; with a client `RX` of `0` it keeps its own congestion control. It responds with the same frame without `CMD` and `OPCODE`, carrying its own receive bandwidth in `RX` (`0` meaning no limit).
+- Client: on `RX_AUTO`, it uses its own non-Brutal congestion control. Otherwise it sends with Brutal at `min(server RX, client upload)`, or at its upload when the server `RX` is `0`; without an upload limit it keeps its non-Brutal congestion control.
 
 A server that cannot negotiate responds with ```rust Err(SQExtError::NotAvailable)```, i.e. `0x01 0x00`. Since it is shorter than the 4-byte frame header, the client treats it like any other failure and keeps its configured congestion control.
