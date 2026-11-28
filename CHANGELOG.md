@@ -26,6 +26,13 @@ Version links compare each release with the preceding tag.
 
 ### Fixed
 
+- A ShadowQUIC connection no longer stalls for up to `half-close-timeout`
+  (60 s by default) when the peer stops a stream while connection-level
+  `MAX_DATA` or the send window is exhausted, as when a speed test with many
+  parallel downloads is cancelled. `quinn-jls` 0.4.0 reported `Blocked` before
+  checking for `STOP_SENDING`, so the stream was never reset and the peer never
+  released connection credit. `quinn-jls` 0.4.1 includes the upstream quinn
+  fix (quinn-rs/quinn#2834).
 - ShadowQUIC Brutal no longer fills the bottleneck queue when its rate exceeds
   the path capacity. The window now follows RTT samples capped at twice the
   windowed minimum RTT, with a periodic PROBE_RTT to drain the queue. In a test
