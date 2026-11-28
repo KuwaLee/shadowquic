@@ -6,13 +6,11 @@ use super::{DurationMs, deserialize_opt_bps};
 use crate::config::{
     AuthUser, CipherSuitePreference, CongestionControl, HasCipherSuitePreference, SocketOpt,
     default_alpn, default_blackhole_detection, default_blackhole_threshold,
-    default_brutal_ack_compensate, default_brutal_cwnd_gain, default_brutal_min_ack_rate,
-    default_brutal_min_sample_count, default_brutal_min_window, default_congestion_control,
-    default_gso, default_half_close_timeout, default_inbound_max_streams, default_initial_mtu,
-    default_keep_alive_interval, default_min_mtu, default_mtu_discovery,
-    default_outbound_max_streams, default_over_stream, default_port_hopping_enable,
-    default_port_hopping_interval, default_port_hopping_jitter, default_store_flush_interval,
-    default_stream_receive_window, default_zero_rtt,
+    default_congestion_control, default_gso, default_half_close_timeout,
+    default_inbound_max_streams, default_initial_mtu, default_keep_alive_interval, default_min_mtu,
+    default_mtu_discovery, default_outbound_max_streams, default_over_stream,
+    default_port_hopping_enable, default_port_hopping_interval, default_port_hopping_jitter,
+    default_store_flush_interval, default_stream_receive_window, default_zero_rtt,
 };
 
 pub fn default_rate_limit() -> u64 {
@@ -72,9 +70,9 @@ pub struct ShadowQuicServerCfg {
     /// Ignore the download rate clients request through Brutal negotiation,
     /// like Hysteria2's `ignoreClientBandwidth`.
     ///
-    /// The server then keeps its own congestion control and reports its
-    /// Brutal `down` to clients, or tells them to use automatic congestion
-    /// control when `down` is not set. Default to false.
+    /// A negotiating client is told to use automatic congestion control,
+    /// and the server sends to it with its base controller, so neither side
+    /// uses Brutal after the negotiation. Default to false.
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
     /// Initial mtu, must be larger than min mtu, at least to be 1200.
@@ -244,13 +242,13 @@ impl Default for ShadowQuicClientCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct BrutalParams {
     /// Sending bandwidth in bits per second (upload for clients, download
     /// for clients of a server).
     ///
-    /// ShadowQUIC: when omitted, the connection uses BBR until the peer
+    /// ShadowQUIC: when omitted or 0, the connection uses BBR until the peer
     /// reports its receive rate through negotiation, which then becomes the
     /// Brutal send rate without a cap. SunnyQUIC: defaults to 10000000.
     #[serde(
@@ -262,34 +260,45 @@ pub struct BrutalParams {
     /// Receiving bandwidth in bits per second, negotiated with the peer
     /// through the mihomo Brutal extension.
     ///
-    /// On a client it is the download rate requested from the server, and
-    /// the negotiation only starts when it is set. On a server it is the
-    /// receive rate reported to clients, which they use to cap their upload.
+    /// On a client it is the download rate requested from the server; the
+    /// client negotiates when this or `bandwidth` is set, and without it the
+    /// server sends with its base controller. On a server it is the receive
+    /// rate reported to clients, which they use to cap their upload. In
+    /// ShadowQUIC, 0 is the same as omitting it.
     #[serde(
         default,
         deserialize_with = "deserialize_opt_bps",
         skip_serializing_if = "Option::is_none"
     )]
     pub down: Option<u64>,
-    pub min_window: u64,
-    pub cwnd_gain: f64,
-    pub min_ack_rate: f64,
-    pub min_sample_count: u64,
-    pub ack_compensate: bool,
-}
-
-impl Default for BrutalParams {
-    fn default() -> Self {
-        Self {
-            bandwidth: None,
-            down: None,
-            min_window: default_brutal_min_window(),
-            cwnd_gain: default_brutal_cwnd_gain(),
-            min_ack_rate: default_brutal_min_ack_rate(),
-            min_sample_count: default_brutal_min_sample_count(),
-            ack_compensate: default_brutal_ack_compensate(),
-        }
-    }
+    /// Smallest window in bytes.
+    ///
+    /// ShadowQUIC defaults to none, so the window is at least one datagram,
+    /// as in Hysteria2. SunnyQUIC defaults to 16384.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_window: Option<u64>,
+    /// Window in multiples of the bandwidth-delay product.
+    ///
+    /// ShadowQUIC paces at the send rate and the window only bounds the data
+    /// in flight; it defaults to 2, as in Hysteria2. SunnyQUIC sends at about
+    /// the window per RTT and defaults to 1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwnd_gain: Option<f64>,
+    /// Lowest ACK rate that loss compensation makes up for, which caps the
+    /// send rate at `bandwidth / min-ack-rate`. Defaults to 0.8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_ack_rate: Option<f64>,
+    /// Packets acknowledged or lost needed before compensating for loss.
+    /// Defaults to 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_sample_count: Option<u64>,
+    /// Raise the send rate by the loss rate of recent packets, so that the
+    /// goodput stays at `bandwidth`.
+    ///
+    /// ShadowQUIC defaults to true, as in Hysteria2, and counts the last 5
+    /// seconds. SunnyQUIC defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_compensate: Option<bool>,
 }
 
 /// Shadowquic outbound configuration

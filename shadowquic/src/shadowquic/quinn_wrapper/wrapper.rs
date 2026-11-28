@@ -14,9 +14,8 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::brutal::{Negotiable, NegotiableConfig};
+use super::brutal::{BrutalConfig, Negotiable, NegotiableConfig};
 use async_trait::async_trait;
-use brutal_core::BrutalConfigCore;
 use bytes::Bytes;
 use quinn::rustls::{
     RootCertStore,
@@ -408,8 +407,7 @@ fn negotiable_controller(congestion_control: &CongestionControl) -> NegotiableCo
             Arc::new(BbrConfig::default())
         }
     };
-    // Without `brutal`, a negotiated Brutal still uses ShadowQUIC's
-    // defaults, not brutal-core's (whose `cwnd_gain` is 1.25).
+    // Without `brutal`, a negotiated Brutal uses the Hysteria2 defaults.
     let default_params = BrutalParams::default();
     let brutal = match congestion_control {
         CongestionControl::Brutal(brutal) => {
@@ -422,23 +420,45 @@ fn negotiable_controller(congestion_control: &CongestionControl) -> NegotiableCo
         }
         _ => &default_params,
     };
+    // A rate of 0 means none, as Hysteria2 only applies rates above 0.
+    let rate = |bps: Option<u64>| bps.filter(|&bps| bps > 0);
     NegotiableConfig::new(
         base,
-        brutal_config_core(brutal),
-        brutal.bandwidth,
-        brutal.down,
+        brutal_config(brutal),
+        rate(brutal.bandwidth),
+        rate(brutal.down),
     )
 }
 
-fn brutal_config_core(brutal: &BrutalParams) -> BrutalConfigCore {
-    BrutalConfigCore::new(
-        brutal.bandwidth.unwrap_or_default(),
-        brutal.min_window,
-        brutal.cwnd_gain,
-        brutal.min_ack_rate,
-        brutal.min_sample_count,
-        brutal.ack_compensate,
-    )
+/// Brutal parameters of ShadowQUIC: the configured ones over Hysteria2's.
+fn brutal_config(brutal: &BrutalParams) -> BrutalConfig {
+    let default = BrutalConfig::default();
+    let mut config = BrutalConfig {
+        cwnd_gain: brutal.cwnd_gain.unwrap_or(default.cwnd_gain),
+        min_window: brutal.min_window.unwrap_or(default.min_window),
+        ack_compensate: brutal.ack_compensate.unwrap_or(default.ack_compensate),
+        min_ack_rate: brutal.min_ack_rate.unwrap_or(default.min_ack_rate),
+        min_sample_count: brutal.min_sample_count.unwrap_or(default.min_sample_count),
+    };
+    if !(config.cwnd_gain > 0.0 && config.cwnd_gain.is_finite()) {
+        warn!(
+            event = "config:invalid_value",
+            cwnd_gain = config.cwnd_gain,
+            "brutal cwnd-gain must be positive, using {}",
+            default.cwnd_gain
+        );
+        config.cwnd_gain = default.cwnd_gain;
+    }
+    if !(config.min_ack_rate > 0.0 && config.min_ack_rate <= 1.0) {
+        warn!(
+            event = "config:invalid_value",
+            min_ack_rate = config.min_ack_rate,
+            "brutal min-ack-rate must be in (0, 1], using {}",
+            default.min_ack_rate
+        );
+        config.min_ack_rate = default.min_ack_rate;
+    }
+    config
 }
 
 fn bind_server_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -667,12 +687,74 @@ impl From<quinn::SendDatagramError> for QuicErrorRepr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_brutal_cwnd_gain;
+    use std::time::Instant;
+
+    fn configured_rates(congestion_control: &CongestionControl) -> (Option<u64>, Option<u64>) {
+        let controller =
+            Arc::new(negotiable_controller(congestion_control)).build(Instant::now(), 1200);
+        let controller = controller.into_any().downcast::<Negotiable>().unwrap();
+        (
+            controller.configured_up_bps(),
+            controller.configured_down_bps(),
+        )
+    }
 
     #[test]
-    fn negotiated_brutal_without_params_uses_shadowquic_defaults() {
-        let core = brutal_config_core(&BrutalParams::default());
-        assert_eq!(core.cwnd_gain, default_brutal_cwnd_gain());
-        assert_ne!(core.cwnd_gain, BrutalConfigCore::default().cwnd_gain);
+    fn zero_brutal_rates_are_unset() {
+        let zero = CongestionControl::Brutal(BrutalParams {
+            bandwidth: Some(0),
+            down: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(configured_rates(&zero), (None, None));
+        let set = CongestionControl::Brutal(BrutalParams {
+            bandwidth: Some(40_000_000),
+            down: Some(80_000_000),
+            ..Default::default()
+        });
+        assert_eq!(configured_rates(&set), (Some(40_000_000), Some(80_000_000)));
+    }
+
+    #[test]
+    fn brutal_without_params_uses_hysteria2_defaults() {
+        let config = brutal_config(&BrutalParams::default());
+        assert_eq!(config, BrutalConfig::default());
+        assert_eq!(config.cwnd_gain, 2.0);
+        assert!(config.ack_compensate);
+        assert_eq!(config.min_ack_rate, 0.8);
+        assert_eq!(config.min_sample_count, 50);
+    }
+
+    #[test]
+    fn brutal_params_override_defaults() {
+        let config = brutal_config(&BrutalParams {
+            cwnd_gain: Some(1.5),
+            min_window: Some(16384),
+            ack_compensate: Some(false),
+            min_ack_rate: Some(0.9),
+            min_sample_count: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            config,
+            BrutalConfig {
+                cwnd_gain: 1.5,
+                min_window: 16384,
+                ack_compensate: false,
+                min_ack_rate: 0.9,
+                min_sample_count: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_brutal_params_fall_back_to_defaults() {
+        let config = brutal_config(&BrutalParams {
+            cwnd_gain: Some(0.0),
+            min_ack_rate: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(config.cwnd_gain, BrutalConfig::default().cwnd_gain);
+        assert_eq!(config.min_ack_rate, BrutalConfig::default().min_ack_rate);
     }
 }

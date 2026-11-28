@@ -23,3 +23,11 @@ panic = "unwind"
 strip = true
 
 [workspace.dependencies]
+
+# ShadowQUIC's Brutal needs quinn-jls congestion controllers that can set the
+# pacing rate, count lost packets and keep their state on a new path. Use
+# quinn-jls 0.4.1 with these hooks until a release includes them.
+[patch.crates-io]
+quinn-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "feat/controller-pacing-rate" }
+quinn-proto-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "feat/controller-pacing-rate" }
+quinn-udp-jls = { git = "https://github.com/KuwaLee/quinn-jls", branch = "feat/controller-pacing-rate" }

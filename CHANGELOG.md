@@ -12,7 +12,10 @@ Version links compare each release with the preceding tag.
 - mihomo-compatible Brutal bandwidth negotiation for ShadowQUIC, following
   Hysteria2's semantics. Set `down` under `congestion-control.brutal` on a
   client to request a download rate; the server reports its own `down` to cap
-  the client's upload. Works with mihomo clients using `up`/`down`.
+  the client's upload. Works with mihomo clients using `up`/`down`. As on
+  Hysteria2 servers, the negotiated rate is kept when the client moves to a
+  new address, such as with port hopping over IPv6 or a switch between Wi-Fi
+  and mobile data, where quinn would otherwise reset congestion control.
 - `ignore-client-bandwidth` on ShadowQUIC servers makes both sides of a
   negotiated connection use BBR, like Hysteria2's `ignoreClientBandwidth`.
 
@@ -22,7 +25,24 @@ Version links compare each release with the preceding tag.
   without `bandwidth` sends at the client's requested rate without a limit.
 - For ShadowQUIC, `bandwidth` under `congestion-control.brutal` is optional and
   no longer defaults to 10000000; without it the connection uses BBR until
-  negotiation provides a rate. SunnyQUIC keeps the old default.
+  negotiation provides a rate. SunnyQUIC keeps the old default. As in
+  Hysteria2, a ShadowQUIC `bandwidth` or `down` of 0 is the same as none.
+- ShadowQUIC Brutal sends like Hysteria2's: packets are paced at the send rate,
+  raised by the loss rate of the last 5 seconds up to 1.25x, and another
+  packet may be sent while the bytes in flight are within twice the
+  bandwidth-delay product, so at least two are in flight even when the RTT is
+  under a millisecond. quinn used to derive the send rate
+  from the window, so Brutal ran at `window / RTT`; with the window sized from
+  an RTT capped at twice the minimum, a 250 Mbit/s download over a mobile link
+  whose loaded RTT grew ran at about 150 Mbit/s. Like Hysteria2, a rate above
+  the path capacity now fills the bottleneck queue and raises latency, so set
+  rates to what the path can carry. Losses are counted in packets, as acks
+  are, so lost small packets are not undercounted. The build patches in a
+  `quinn-jls` whose congestion controllers can set the pacing rate, are told
+  how many packets were lost, and can keep their state on a new path.
+- ShadowQUIC Brutal parameters default to Hysteria2's: `cwnd-gain` 2,
+  `ack-compensate` true and no `min-window`. SunnyQUIC keeps 1.1, false and
+  16384.
 
 ### Fixed
 
@@ -33,14 +53,6 @@ Version links compare each release with the preceding tag.
   checking for `STOP_SENDING`, so the stream was never reset and the peer never
   released connection credit. `quinn-jls` 0.4.1 includes the upstream quinn
   fix (quinn-rs/quinn#2834).
-- ShadowQUIC Brutal no longer fills the bottleneck queue when its rate exceeds
-  the path capacity. The window now follows RTT samples capped at twice the
-  windowed minimum RTT, with a periodic PROBE_RTT to drain the queue. In a test
-  at 1.6x a 20 Mbit/s bottleneck, loaded latency rose by about 60 ms instead of
-  1.8 s, with the same throughput.
-- Brutal negotiated on a server without `brutal` parameters uses ShadowQUIC's
-  defaults (`cwnd-gain` 1.1) instead of brutal-core's 1.25, which sent well
-  above the requested rate.
 
 ## [0.4.14](https://github.com/spongebob888/shadowquic/compare/v0.4.13...v0.4.14) - 2026-11-26
 

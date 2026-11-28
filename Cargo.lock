@@ -2860,8 +2860,7 @@ dependencies = [
 [[package]]
 name = "quinn-jls"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a65162de32887d0e7152cb17aaba5caec84f3fd48a9575a84ffdaed122e6790"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=feat%2Fcontroller-pacing-rate#b4b81abc32ece90c57f4157e244ddeb509cd01b3"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2880,8 +2879,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto-jls"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f7de872e60b6f7f9a2805d7ee93792dfa70e76de95257e2200a0f6ebb0858c"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=feat%2Fcontroller-pacing-rate#b4b81abc32ece90c57f4157e244ddeb509cd01b3"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2902,9 +2900,8 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp-jls"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5749a7be268ab1c4fb36b2d6011bffb2c692a7d668c0116663289aa2e91b6d"
+version = "0.4.1"
+source = "git+https://github.com/KuwaLee/quinn-jls?branch=feat%2Fcontroller-pacing-rate#b4b81abc32ece90c57f4157e244ddeb509cd01b3"
 dependencies = [
  "cfg_aliases",
  "libc",

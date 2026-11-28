@@ -427,17 +427,7 @@ pub fn gen_client_cfg(cfg: &SunnyQuicClientCfg) -> noq::ClientConfig {
                 ?brutal,
                 "using brutal congestion control"
             );
-            let brutal_config = BrutalConfig::new(
-                brutal
-                    .bandwidth
-                    .unwrap_or_else(crate::config::default_brutal_bandwidth),
-                brutal.min_window,
-                brutal.cwnd_gain,
-                brutal.min_ack_rate,
-                brutal.min_sample_count,
-                brutal.ack_compensate,
-            );
-            tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
+            tp_cfg.congestion_controller_factory(Arc::new(brutal_config(brutal)))
         }
     };
     let mut config = ClientConfig::new(Arc::new(
@@ -591,17 +581,7 @@ fn gen_server_config(
                 ?brutal,
                 "using brutal congestion control"
             );
-            let brutal_config = BrutalConfig::new(
-                brutal
-                    .bandwidth
-                    .unwrap_or_else(crate::config::default_brutal_bandwidth),
-                brutal.min_window,
-                brutal.cwnd_gain,
-                brutal.min_ack_rate,
-                brutal.min_sample_count,
-                brutal.ack_compensate,
-            );
-            tp_cfg.congestion_controller_factory(Arc::new(brutal_config))
+            tp_cfg.congestion_controller_factory(Arc::new(brutal_config(brutal)))
         }
         CongestionControl::Bbr => {
             warn!(
@@ -662,4 +642,26 @@ impl From<rustls::Error> for SError {
     fn from(value: rustls::Error) -> Self {
         SError::RustlsError(value.to_string())
     }
+}
+
+/// Brutal controller of SunnyQUIC, with SunnyQUIC's defaults.
+fn brutal_config(brutal: &crate::config::BrutalParams) -> BrutalConfig {
+    use crate::config::{
+        default_brutal_ack_compensate, default_brutal_bandwidth, default_brutal_cwnd_gain,
+        default_brutal_min_ack_rate, default_brutal_min_sample_count, default_brutal_min_window,
+    };
+    BrutalConfig::new(
+        brutal.bandwidth.unwrap_or_else(default_brutal_bandwidth),
+        brutal.min_window.unwrap_or_else(default_brutal_min_window),
+        brutal.cwnd_gain.unwrap_or_else(default_brutal_cwnd_gain),
+        brutal
+            .min_ack_rate
+            .unwrap_or_else(default_brutal_min_ack_rate),
+        brutal
+            .min_sample_count
+            .unwrap_or_else(default_brutal_min_sample_count),
+        brutal
+            .ack_compensate
+            .unwrap_or_else(default_brutal_ack_compensate),
+    )
 }

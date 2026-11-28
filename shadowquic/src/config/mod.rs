@@ -1051,22 +1051,27 @@ pub fn default_brutal_bandwidth() -> u64 {
     10_000_000
 }
 
+/// SunnyQUIC default of `cwnd-gain`.
 pub fn default_brutal_cwnd_gain() -> f64 {
     1.10
 }
 
+/// SunnyQUIC default of `min-window`.
 pub fn default_brutal_min_window() -> u64 {
     16 * 1024
 }
 
+/// SunnyQUIC default of `min-ack-rate`.
 pub fn default_brutal_min_ack_rate() -> f64 {
     0.8
 }
 
+/// SunnyQUIC default of `min-sample-count`.
 pub fn default_brutal_min_sample_count() -> u64 {
     50
 }
 
+/// SunnyQUIC default of `ack-compensate`.
 pub fn default_brutal_ack_compensate() -> bool {
     false
 }
@@ -1103,6 +1108,13 @@ pub fn default_brutal_ack_compensate() -> bool {
 /// set; if the server does not support it, the configured rate is kept.
 /// SunnyQUIC does not negotiate; it ignores `down` and defaults `bandwidth` to
 /// 10000000.
+///
+/// ShadowQUIC's Brutal sends like Hysteria2's: it paces at the send rate,
+/// raised by the loss rate of the last 5 seconds up to 1.25x, and allows twice
+/// the bandwidth-delay product in flight. It does not slow down when the RTT
+/// grows, so a rate above the path capacity fills the bottleneck queue and
+/// raises latency: set rates to what the path can carry. SunnyQUIC's Brutal
+/// sends about one window per RTT.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub enum CongestionControl {

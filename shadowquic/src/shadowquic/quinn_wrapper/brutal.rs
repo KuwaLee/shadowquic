@@ -1,12 +1,17 @@
 //! Congestion controller that can switch between a base algorithm and Brutal
 //! while the connection is running, for mihomo-compatible Brutal negotiation.
+//!
+//! Brutal works like Hysteria2's (`core/internal/congestion/brutal` in
+//! apernet/hysteria, also used by mihomo and Xray): packets are paced at the
+//! target rate divided by the ACK rate, whatever the RTT, and the window of
+//! twice the bandwidth-delay product only bounds the data in flight. The
+//! pacing rate reaches quinn through `Controller::pacing_rate`.
 
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use brutal_core::{BrutalConfigCore, BrutalCore};
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 use quinn_proto::RttEstimator;
 use tracing::trace;
@@ -25,67 +30,169 @@ fn encode_mode(mode: BrutalSendMode) -> u64 {
     }
 }
 
-/// Length of the windowed minimum RTT filter, as in BBR.
-const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
+/// Brutal window before the first RTT sample, as in Hysteria2.
+const INITIAL_WINDOW: u64 = 10240;
 
-/// Minimum RTT sample over the last [`MIN_RTT_WINDOW`] to
-/// `2 * MIN_RTT_WINDOW`, so the estimate follows a path whose base RTT grows.
+/// Number of one-second slots the ACK rate is computed from, as in Hysteria2.
+const ACK_RATE_SLOTS: usize = 5;
+
+/// Seconds between ACK rate trace events.
+const ACK_RATE_TRACE_INTERVAL: u64 = 2;
+
+/// Brutal parameters. The defaults are Hysteria2's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrutalConfig {
+    /// Window in multiples of the bandwidth-delay product.
+    pub cwnd_gain: f64,
+    /// Smallest window in bytes; the window is never below one datagram.
+    pub min_window: u64,
+    /// Whether to raise the send rate by the loss rate, to keep the goodput
+    /// at the target.
+    pub ack_compensate: bool,
+    /// Lowest ACK rate compensated for, which caps the send rate at
+    /// `target / min_ack_rate`.
+    pub min_ack_rate: f64,
+    /// Packets acknowledged or lost over the last [`ACK_RATE_SLOTS`] seconds
+    /// needed before compensating.
+    pub min_sample_count: u64,
+}
+
+impl Default for BrutalConfig {
+    fn default() -> Self {
+        Self {
+            cwnd_gain: 2.0,
+            min_window: 0,
+            ack_compensate: true,
+            min_ack_rate: 0.8,
+            min_sample_count: 50,
+        }
+    }
+}
+
+/// Packets acknowledged and lost within one second.
 #[derive(Debug, Clone, Copy, Default)]
-struct MinRttFilter {
-    current: Option<(Duration, Instant)>,
-    previous: Option<Duration>,
+struct AckSlot {
+    second: u64,
+    acked: u64,
+    lost: u64,
 }
 
-impl MinRttFilter {
-    fn update(&mut self, sample: Duration, now: Instant) {
-        match &mut self.current {
-            Some((min, start)) if now.saturating_duration_since(*start) < MIN_RTT_WINDOW => {
-                *min = (*min).min(sample);
-            }
-            current => {
-                self.previous = current.map(|(min, _)| min);
-                *current = Some((sample, now));
-            }
+/// Brutal state of a connection.
+#[derive(Debug, Clone)]
+struct Brutal {
+    config: BrutalConfig,
+    /// Target send rate in bytes per second.
+    rate: u64,
+    /// Fraction of recent packets that were acknowledged, in
+    /// `[min_ack_rate, 1]`; 1 without compensation.
+    ack_rate: f64,
+    slots: [AckSlot; ACK_RATE_SLOTS],
+    last_trace: Option<u64>,
+}
+
+impl Brutal {
+    fn new(config: BrutalConfig, bps: u64) -> Self {
+        Self {
+            config,
+            rate: bytes_per_second(bps),
+            ack_rate: 1.0,
+            slots: [AckSlot::default(); ACK_RATE_SLOTS],
+            last_trace: None,
         }
     }
 
-    fn get(&self) -> Option<Duration> {
-        let current = self.current.map(|(min, _)| min);
-        match (current, self.previous) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+    fn set_rate(&mut self, bps: u64) {
+        self.rate = bytes_per_second(bps);
+    }
+
+    /// Target send rate in bits per second.
+    fn target_bps(&self) -> u64 {
+        self.rate.saturating_mul(8)
+    }
+
+    /// Pacing rate in bytes per second: the target, raised to make up for
+    /// packet loss.
+    fn pacing_rate(&self) -> u64 {
+        (self.rate as f64 / self.ack_rate) as u64
+    }
+
+    /// Hysteria2's congestion window: the bytes in flight up to which
+    /// another packet may be sent.
+    fn cwnd(&self, smoothed_rtt: Option<Duration>, mtu: u16) -> u64 {
+        let Some(rtt) = smoothed_rtt.filter(|rtt| !rtt.is_zero()) else {
+            return INITIAL_WINDOW;
+        };
+        let window = self.rate as f64 * rtt.as_secs_f64() * self.config.cwnd_gain / self.ack_rate;
+        (window as u64)
+            .max(self.config.min_window)
+            .max(u64::from(mtu))
+    }
+
+    /// Counts packets in the slot of `second`, resetting it if it holds an
+    /// older second.
+    fn record(&mut self, second: u64, acked: u64, lost: u64) {
+        let slot = &mut self.slots[(second % ACK_RATE_SLOTS as u64) as usize];
+        if slot.second == second {
+            slot.acked += acked;
+            slot.lost += lost;
+        } else {
+            *slot = AckSlot {
+                second,
+                acked,
+                lost,
+            };
+        }
+    }
+
+    fn update_ack_rate(&mut self, second: u64, smoothed_rtt: Option<Duration>) {
+        if !self.config.ack_compensate {
+            return;
+        }
+        // The current second and the four before it. Hysteria2 resets the
+        // current slot first; the slot may still hold the second five before
+        // when nothing was counted in this one yet.
+        let oldest = second.saturating_sub(ACK_RATE_SLOTS as u64 - 1);
+        let (acked, lost) = self
+            .slots
+            .iter()
+            .filter(|slot| slot.second >= oldest)
+            .fold((0, 0), |(acked, lost), slot| {
+                (acked + slot.acked, lost + slot.lost)
+            });
+        let total = acked + lost;
+        self.ack_rate = if total < self.config.min_sample_count || total == 0 {
+            1.0
+        } else {
+            (acked as f64 / total as f64).max(self.config.min_ack_rate)
+        };
+        if self
+            .last_trace
+            .is_none_or(|last| second >= last + ACK_RATE_TRACE_INTERVAL)
+        {
+            self.last_trace = Some(second);
+            trace!(
+                event = "recovery:brutal_ack_rate",
+                ack_rate = self.ack_rate,
+                acked,
+                lost,
+                target_bps = self.target_bps(),
+                pacing_bps = self.pacing_rate().saturating_mul(8),
+                rtt_ms = smoothed_rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
+                "brutal ack rate updated"
+            );
         }
     }
 }
 
-/// Cap of the RTT Brutal sizes its window from, in multiples of the windowed
-/// minimum RTT. Samples below the cap follow jitter, while the cap stops a
-/// standing queue from growing the window.
-const MAX_RTT_OVER_MIN: u32 = 2;
-
-/// How often Brutal drains its queue to measure the base RTT, as BBR's
-/// PROBE_RTT. Shorter than [`MIN_RTT_WINDOW`] so every window gets a sample.
-const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(8);
-/// How long the window stays drained once in flight data is down.
-const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
-/// Window while probing, in packets.
-const PROBE_RTT_PACKETS: u64 = 4;
-
-/// PROBE_RTT state of the Brutal controller.
-#[derive(Debug, Clone, Copy)]
-enum ProbeRtt {
-    /// Sending normally until the next probe.
-    Idle { next: Instant },
-    /// Window cut, waiting for in flight data to drop.
-    Draining,
-    /// Drained; samples now see the base RTT.
-    Probing { until: Instant },
+/// Converts bits per second to bytes per second, at least 1.
+fn bytes_per_second(bps: u64) -> u64 {
+    (bps / 8).max(1)
 }
 
 /// Factory of [`Negotiable`] controllers.
 pub struct NegotiableConfig {
     base: Arc<dyn ControllerFactory + Send + Sync>,
-    brutal: BrutalConfigCore,
+    brutal: BrutalConfig,
     /// Configured Brutal send rate. `None` starts with the base controller.
     up_bps: Option<u64>,
     /// Receive rate reported to the peer during negotiation.
@@ -95,7 +202,7 @@ pub struct NegotiableConfig {
 impl NegotiableConfig {
     pub fn new(
         base: Arc<dyn ControllerFactory + Send + Sync>,
-        brutal: BrutalConfigCore,
+        brutal: BrutalConfig,
         up_bps: Option<u64>,
         down_bps: Option<u64>,
     ) -> Self {
@@ -119,19 +226,18 @@ impl ControllerFactory for NegotiableConfig {
         );
         let mut controller = Negotiable {
             base: self.base.clone().build(now, current_mtu),
+            base_factory: self.base.clone(),
             brutal: None,
             brutal_config: self.brutal.clone(),
             up_bps: self.up_bps,
             down_bps: self.down_bps,
             mtu: current_mtu,
-            min_rtt: MinRttFilter::default(),
-            probe_rtt: ProbeRtt::Idle {
-                next: now + PROBE_RTT_INTERVAL,
-            },
+            smoothed_rtt: None,
+            epoch: now,
             mode: Arc::new(AtomicU64::new(MODE_CONFIGURED)),
             applied_mode: MODE_CONFIGURED,
         };
-        controller.apply(MODE_CONFIGURED, now);
+        controller.apply(MODE_CONFIGURED);
         Box::new(controller)
     }
 }
@@ -139,27 +245,28 @@ impl ControllerFactory for NegotiableConfig {
 /// Controller of one connection. It uses Brutal when a send rate is
 /// configured or negotiated, and the base controller otherwise.
 ///
-/// Brutal sizes its window from RTT samples capped at [`MAX_RTT_OVER_MIN`]
-/// times the windowed minimum RTT. quinn paces from the
-/// window, so the send rate is `window / RTT`: once a bottleneck queue pushes
-/// the RTT past the cap, the rate drops below the target instead of the window
-/// growing with the queue, which bounds the queueing delay when the target
-/// exceeds the path capacity. Jitter below the cap does not shrink the window.
-/// Every [`PROBE_RTT_INTERVAL`] the window briefly drops to a few packets to
-/// drain the queue, so a long-standing queue is never taken for the base RTT.
+/// Brutal paces at the target rate divided by the ACK rate of the last
+/// [`ACK_RATE_SLOTS`] seconds, and its window is `cwnd_gain` times the
+/// bandwidth-delay product from quinn's smoothed RTT, divided by the ACK rate.
+/// Like Hysteria2, nothing lowers the rate when the RTT grows, so a target
+/// above the path capacity fills the bottleneck queue.
 ///
 /// `mode` is shared with every clone of the controller, including the
-/// snapshot returned by `quinn::Connection::congestion_state`, so the
-/// negotiated mode reaches the live connection on its next callback.
+/// snapshot returned by `quinn::Connection::congestion_state` and the
+/// controller of a new path, so the negotiated mode reaches the live
+/// connection on its next callback.
 pub struct Negotiable {
     base: Box<dyn Controller>,
-    brutal: Option<BrutalCore>,
-    brutal_config: BrutalConfigCore,
+    base_factory: Arc<dyn ControllerFactory + Send + Sync>,
+    brutal: Option<Brutal>,
+    brutal_config: BrutalConfig,
     up_bps: Option<u64>,
     down_bps: Option<u64>,
     mtu: u16,
-    min_rtt: MinRttFilter,
-    probe_rtt: ProbeRtt,
+    /// quinn's smoothed RTT as of the last ACK, `None` before any.
+    smoothed_rtt: Option<Duration>,
+    /// Start of the seconds the ACK rate slots are keyed by.
+    epoch: Instant,
     mode: Arc<AtomicU64>,
     applied_mode: u64,
 }
@@ -168,13 +275,14 @@ impl Clone for Negotiable {
     fn clone(&self) -> Self {
         Self {
             base: self.base.clone_box(),
+            base_factory: self.base_factory.clone(),
             brutal: self.brutal.clone(),
             brutal_config: self.brutal_config.clone(),
             up_bps: self.up_bps,
             down_bps: self.down_bps,
             mtu: self.mtu,
-            min_rtt: self.min_rtt,
-            probe_rtt: self.probe_rtt,
+            smoothed_rtt: self.smoothed_rtt,
+            epoch: self.epoch,
             mode: self.mode.clone(),
             applied_mode: self.applied_mode,
         }
@@ -197,57 +305,46 @@ impl Negotiable {
         self.mode.store(encode_mode(mode), Ordering::Relaxed);
     }
 
-    /// Whether Brutal is in use, for tests.
+    /// Brutal target rate in bits per second, `None` with the base controller.
     #[cfg(test)]
     fn brutal_rate(&self) -> Option<u64> {
-        self.brutal.as_ref().map(BrutalCore::target_bps)
+        self.brutal.as_ref().map(Brutal::target_bps)
     }
 
-    /// Feeds an ACK to Brutal with its RTT sample capped at
-    /// [`MAX_RTT_OVER_MIN`] times the windowed minimum RTT. The raw sample,
-    /// unlike quinn's smoothed RTT, includes the peer's ACK delay, which is
-    /// what the window has to cover. BrutalCore smooths the samples.
-    fn on_brutal_ack(&mut self, now: Instant, sent: Instant, bytes: u64) {
-        let sample = now.saturating_duration_since(sent);
-        self.min_rtt.update(sample, now);
-        let cap = self
-            .min_rtt
-            .get()
-            .map_or(sample, |min| min * MAX_RTT_OVER_MIN);
+    fn second(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs()
+    }
+
+    fn on_brutal_ack(&mut self, now: Instant) {
+        let second = self.second(now);
         if let Some(brutal) = self.brutal.as_mut() {
-            brutal.on_ack_bytes(bytes, sample.min(cap));
+            brutal.record(second, 1, 0);
         }
     }
 
-    fn probe_window(&self) -> u64 {
-        PROBE_RTT_PACKETS * u64::from(self.mtu)
+    fn on_brutal_loss(&mut self, now: Instant, lost: u64) {
+        let second = self.second(now);
+        if let Some(brutal) = self.brutal.as_mut() {
+            brutal.record(second, 0, lost);
+            brutal.update_ack_rate(second, self.smoothed_rtt);
+        }
     }
 
-    fn probing(&self) -> bool {
-        !matches!(self.probe_rtt, ProbeRtt::Idle { .. })
+    fn update_brutal_ack_rate(&mut self, now: Instant) {
+        let second = self.second(now);
+        if let Some(brutal) = self.brutal.as_mut() {
+            brutal.update_ack_rate(second, self.smoothed_rtt);
+        }
     }
 
-    fn update_probe_rtt(&mut self, now: Instant, in_flight: u64) {
-        self.probe_rtt = match self.probe_rtt {
-            ProbeRtt::Idle { next } if now >= next => ProbeRtt::Draining,
-            ProbeRtt::Draining if in_flight <= self.probe_window() => ProbeRtt::Probing {
-                until: now + PROBE_RTT_DURATION,
-            },
-            ProbeRtt::Probing { until } if now >= until => ProbeRtt::Idle {
-                next: now + PROBE_RTT_INTERVAL,
-            },
-            state => state,
-        };
-    }
-
-    fn sync(&mut self, now: Instant) {
+    fn sync(&mut self) {
         let mode = self.mode.load(Ordering::Relaxed);
         if mode != self.applied_mode {
-            self.apply(mode, now);
+            self.apply(mode);
         }
     }
 
-    fn apply(&mut self, mode: u64, now: Instant) {
+    fn apply(&mut self, mode: u64) {
         self.applied_mode = mode;
         let rate = match mode {
             MODE_CONFIGURED => self.up_bps,
@@ -256,15 +353,8 @@ impl Negotiable {
         };
         match (rate, self.brutal.as_mut()) {
             (None, _) => self.brutal = None,
-            (Some(bps), Some(brutal)) => brutal.set_peer_bandwidth_hint(Some(bps)),
-            (Some(bps), None) => {
-                let mut config = self.brutal_config.clone();
-                config.default_bandwidth_bps = bps;
-                self.brutal = Some(BrutalCore::new(config, now, self.mtu));
-                self.probe_rtt = ProbeRtt::Idle {
-                    next: now + PROBE_RTT_INTERVAL,
-                };
-            }
+            (Some(bps), Some(brutal)) => brutal.set_rate(bps),
+            (Some(bps), None) => self.brutal = Some(Brutal::new(self.brutal_config.clone(), bps)),
         }
         trace!(
             event = "recovery:controller_mode_changed",
@@ -276,10 +366,9 @@ impl Negotiable {
 
 impl Controller for Negotiable {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        self.sync(now);
-        match self.brutal.as_mut() {
-            Some(brutal) => brutal.on_sent(bytes),
-            None => self.base.on_sent(now, bytes, last_packet_number),
+        self.sync();
+        if self.brutal.is_none() {
+            self.base.on_sent(now, bytes, last_packet_number);
         }
     }
 
@@ -291,11 +380,10 @@ impl Controller for Negotiable {
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        self.smoothed_rtt = Some(rtt.get());
         if self.brutal.is_some() {
-            self.on_brutal_ack(now, sent, bytes);
+            self.on_brutal_ack(now);
         } else {
-            self.min_rtt
-                .update(now.saturating_duration_since(sent), now);
             self.base.on_ack(now, sent, bytes, app_limited, rtt);
         }
     }
@@ -307,15 +395,20 @@ impl Controller for Negotiable {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
-        self.sync(now);
-        match self.brutal.as_mut() {
-            Some(brutal) => {
-                brutal.on_end_acks(now);
-                self.update_probe_rtt(now, in_flight);
-            }
-            None => self
-                .base
-                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked),
+        self.sync();
+        if self.brutal.is_some() {
+            self.update_brutal_ack_rate(now);
+        } else {
+            self.base
+                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        }
+    }
+
+    fn on_packets_lost(&mut self, now: Instant, lost_packets: u64) {
+        if self.brutal.is_some() {
+            self.on_brutal_loss(now, lost_packets);
+        } else {
+            self.base.on_packets_lost(now, lost_packets);
         }
     }
 
@@ -327,15 +420,11 @@ impl Controller for Negotiable {
         is_ecn: bool,
         lost_bytes: u64,
     ) {
-        match self.brutal.as_mut() {
-            Some(brutal) => brutal.on_loss_bytes(lost_bytes),
-            None => self.base.on_congestion_event(
-                now,
-                sent,
-                is_persistent_congestion,
-                is_ecn,
-                lost_bytes,
-            ),
+        // Brutal counts losses in `on_packets_lost`, and ignores ECN like
+        // Hysteria2.
+        if self.brutal.is_none() {
+            self.base
+                .on_congestion_event(now, sent, is_persistent_congestion, is_ecn, lost_bytes);
         }
     }
 
@@ -348,24 +437,30 @@ impl Controller for Negotiable {
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.mtu = new_mtu;
         self.base.on_mtu_update(new_mtu);
-        if let Some(brutal) = self.brutal.as_mut() {
-            brutal.on_mtu_update(new_mtu);
-        }
     }
 
     fn window(&self) -> u64 {
         match self.brutal.as_ref() {
-            Some(brutal) if self.probing() => brutal.window_cached().min(self.probe_window()),
-            Some(brutal) => brutal.window_cached(),
+            // quinn sends a packet only if it fits in the window, while
+            // Hysteria2 sends whenever the bytes in flight are within it, so
+            // one more datagram fits.
+            Some(brutal) => brutal
+                .cwnd(self.smoothed_rtt, self.mtu)
+                .saturating_add(u64::from(self.mtu)),
             None => self.base.window(),
         }
+    }
+
+    fn pacing_rate(&self) -> Option<u64> {
+        self.brutal.as_ref().map(Brutal::pacing_rate)
     }
 
     fn metrics(&self) -> ControllerMetrics {
         match self.brutal.as_ref() {
             Some(brutal) => {
                 let mut metrics = ControllerMetrics::default();
-                metrics.congestion_window = brutal.window_cached();
+                metrics.congestion_window = self.window();
+                metrics.pacing_rate = Some(brutal.pacing_rate().saturating_mul(8));
                 metrics.bandwidth_estimate = Some(brutal.target_bps());
                 metrics
             }
@@ -379,9 +474,25 @@ impl Controller for Negotiable {
 
     fn initial_window(&self) -> u64 {
         match self.brutal.as_ref() {
-            Some(brutal) => brutal.initial_window(),
+            Some(_) => INITIAL_WINDOW + u64::from(self.mtu),
             None => self.base.initial_window(),
         }
+    }
+
+    fn for_new_path(&self, now: Instant, current_mtu: u16) -> Option<Box<dyn Controller>> {
+        // Hysteria2 servers follow a client to a new address without
+        // resetting congestion control, so Brutal keeps its rate, ACK rate
+        // and RTT. Only the base controller starts over.
+        trace!(
+            event = "recovery:controller_path_changed",
+            brutal_bps = self.brutal.as_ref().map(Brutal::target_bps),
+            mtu = current_mtu,
+            "congestion controller carried over to a new path"
+        );
+        let mut controller = self.clone();
+        controller.base = self.base_factory.clone().build(now, current_mtu);
+        controller.mtu = current_mtu;
+        Some(Box::new(controller))
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -394,19 +505,24 @@ mod tests {
     use super::*;
     use quinn::congestion::BbrConfig;
 
-    fn controller(up: Option<u64>, down: Option<u64>) -> Box<dyn Controller> {
-        let brutal = BrutalConfigCore {
-            min_window: 1,
-            cwnd_gain: 1.0,
-            ..Default::default()
-        };
+    const MTU: u16 = 1200;
+
+    fn controller_with(
+        brutal: BrutalConfig,
+        up: Option<u64>,
+        down: Option<u64>,
+    ) -> Box<dyn Controller> {
         Arc::new(NegotiableConfig::new(
             Arc::new(BbrConfig::default()),
             brutal,
             up,
             down,
         ))
-        .build(Instant::now(), 1200)
+        .build(Instant::now(), MTU)
+    }
+
+    fn controller(up: Option<u64>, down: Option<u64>) -> Box<dyn Controller> {
+        controller_with(BrutalConfig::default(), up, down)
     }
 
     fn snapshot(controller: &dyn Controller) -> Box<Negotiable> {
@@ -414,85 +530,179 @@ mod tests {
         controller.clone_box().into_any().downcast().unwrap()
     }
 
-    #[test]
-    fn min_rtt_filter_keeps_minimum_within_window() {
-        let start = Instant::now();
-        let mut filter = MinRttFilter::default();
-        assert_eq!(filter.get(), None);
-        filter.update(Duration::from_millis(30), start);
-        filter.update(Duration::from_millis(20), start + Duration::from_secs(1));
-        filter.update(Duration::from_millis(400), start + Duration::from_secs(2));
-        assert_eq!(filter.get(), Some(Duration::from_millis(20)));
+    /// Brutal at 80 Mbit/s = 10 MB/s with a 20ms smoothed RTT.
+    fn brutal_80m(config: BrutalConfig) -> Box<Negotiable> {
+        let mut brutal = snapshot(&*controller_with(config, Some(80_000_000), None));
+        brutal.smoothed_rtt = Some(Duration::from_millis(20));
+        brutal
     }
 
-    #[test]
-    fn min_rtt_filter_follows_a_higher_base_rtt() {
-        let start = Instant::now();
-        let mut filter = MinRttFilter::default();
-        filter.update(Duration::from_millis(20), start);
-        // The path changes: every sample is now 50ms.
-        filter.update(Duration::from_millis(50), start + MIN_RTT_WINDOW);
-        assert_eq!(filter.get(), Some(Duration::from_millis(20)));
-        filter.update(Duration::from_millis(50), start + MIN_RTT_WINDOW * 2);
-        assert_eq!(filter.get(), Some(Duration::from_millis(50)));
-    }
-
-    #[test]
-    fn queueing_delay_does_not_grow_brutal_window() {
-        let mut brutal = snapshot(&*controller(Some(80_000_000), None));
-        let mut now = Instant::now();
-        let exchange = |brutal: &mut Negotiable, now: &mut Instant, rtt_ms: u64, i: u64| {
-            let sent = *now;
-            *now += Duration::from_millis(rtt_ms);
-            brutal.on_sent(sent, 1200, i);
-            brutal.on_brutal_ack(*now, sent, 1200);
-            // Large in flight data keeps the probe draining.
-            brutal.on_end_acks(*now, u64::MAX, false, Some(i));
-        };
-        for i in 0..100 {
-            exchange(&mut brutal, &mut now, 20, i);
+    /// Reports `acked` and `lost` packets within the same second, the way
+    /// quinn does after an ACK frame.
+    fn exchange(brutal: &mut Negotiable, now: Instant, acked: u64, lost: u64) {
+        for _ in 0..acked {
+            brutal.on_brutal_ack(now);
         }
-        brutal.probe_rtt = ProbeRtt::Idle {
-            next: now + Duration::from_secs(3600),
-        };
-        let window = brutal.window();
-        // 80 Mbit/s * 20ms = 200 kB.
-        assert!((190_000..=210_000).contains(&window), "{window}");
-        // A standing queue adds 200ms to every sample. Within the filter
-        // window the RTT Brutal uses stays at twice the minimum; longer queues
-        // are drained by PROBE_RTT.
-        for i in 100..140 {
-            exchange(&mut brutal, &mut now, 220, i);
+        brutal.on_end_acks(now, 0, false, None);
+        if lost > 0 {
+            // Small packets: Brutal counts packets, not bytes.
+            brutal.on_packets_lost(now, lost);
+            brutal.on_congestion_event(now, now, false, false, lost * 100);
         }
-        let capped = brutal.window();
-        assert!(
-            (window * 19 / 10..=window * 21 / 10).contains(&capped),
-            "{window} -> {capped}"
-        );
     }
 
     #[test]
-    fn probe_rtt_drains_then_restores_window() {
-        let mut brutal = snapshot(&*controller(Some(80_000_000), None));
-        let start = Instant::now();
-        let full = brutal.window();
-        assert!(full > brutal.probe_window());
+    fn brutal_paces_at_target_rate() {
+        let brutal = brutal_80m(BrutalConfig::default());
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+        let metrics = brutal.metrics();
+        assert_eq!(metrics.pacing_rate, Some(80_000_000));
+        assert_eq!(metrics.bandwidth_estimate, Some(80_000_000));
+    }
 
-        // Due: the window drops to a few packets until in flight data follows.
-        let due = start + PROBE_RTT_INTERVAL;
-        brutal.on_end_acks(due, full, false, Some(0));
-        assert_eq!(brutal.window(), brutal.probe_window());
-        brutal.on_end_acks(due, full, false, Some(1));
-        assert!(matches!(brutal.probe_rtt, ProbeRtt::Draining));
+    #[test]
+    fn base_controller_leaves_pacing_to_quinn() {
+        let base = snapshot(&*controller(None, None));
+        assert_eq!(base.pacing_rate(), None);
+    }
 
-        let drained = due + Duration::from_millis(30);
-        brutal.on_end_acks(drained, 0, false, Some(2));
-        assert!(matches!(brutal.probe_rtt, ProbeRtt::Probing { .. }));
-        assert_eq!(brutal.window(), brutal.probe_window());
+    /// quinn's window for a Hysteria2 congestion window: one more datagram.
+    fn quinn_window(cwnd: u64) -> u64 {
+        cwnd + u64::from(MTU)
+    }
 
-        brutal.on_end_acks(drained + PROBE_RTT_DURATION, 0, false, Some(3));
-        assert!(matches!(brutal.probe_rtt, ProbeRtt::Idle { .. }));
-        assert_eq!(brutal.window(), full);
+    #[test]
+    fn brutal_window_is_twice_bdp() {
+        let brutal = brutal_80m(BrutalConfig::default());
+        // 10 MB/s * 20ms * 2
+        assert_eq!(brutal.window(), quinn_window(400_000));
+    }
+
+    #[test]
+    fn brutal_window_before_rtt_sample() {
+        let brutal = snapshot(&*controller(Some(80_000_000), None));
+        assert_eq!(brutal.window(), quinn_window(INITIAL_WINDOW));
+        assert_eq!(brutal.initial_window(), quinn_window(INITIAL_WINDOW));
+    }
+
+    #[test]
+    fn brutal_window_follows_queueing_delay() {
+        // A standing queue adds 200ms: the window grows with it and the
+        // pacing rate stays at the target, as in Hysteria2.
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        brutal.smoothed_rtt = Some(Duration::from_millis(220));
+        assert_eq!(brutal.window(), quinn_window(4_400_000));
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+    }
+
+    #[test]
+    fn brutal_window_has_a_floor() {
+        // As in Hysteria2, a second datagram may be sent while one is in
+        // flight, so a receiver that acknowledges every other packet does
+        // not wait for its ACK delay.
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        brutal.smoothed_rtt = Some(Duration::from_micros(1));
+        assert_eq!(brutal.window(), 2 * u64::from(MTU));
+
+        let mut brutal = brutal_80m(BrutalConfig {
+            min_window: 16 * 1024,
+            ..Default::default()
+        });
+        brutal.smoothed_rtt = Some(Duration::from_micros(1));
+        assert_eq!(brutal.window(), quinn_window(16 * 1024));
+    }
+
+    #[test]
+    fn brutal_window_saturates() {
+        // A client may ask a server without `bandwidth` for any rate.
+        let mut brutal = snapshot(&*controller(Some(u64::MAX), None));
+        brutal.smoothed_rtt = Some(Duration::from_secs(10));
+        assert_eq!(brutal.window(), u64::MAX);
+
+        let mut brutal = brutal_80m(BrutalConfig {
+            min_window: u64::MAX,
+            ..Default::default()
+        });
+        brutal.smoothed_rtt = Some(Duration::from_millis(20));
+        assert_eq!(brutal.window(), u64::MAX);
+    }
+
+    #[test]
+    fn loss_raises_pacing_rate_and_window() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let now = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, now, 90, 10);
+        let ack_rate = brutal.brutal.as_ref().unwrap().ack_rate;
+        assert!((ack_rate - 0.9).abs() < 1e-9, "{ack_rate}");
+        assert_eq!(brutal.pacing_rate(), Some(11_111_111));
+        assert_eq!(brutal.window(), quinn_window(444_444));
+    }
+
+    #[test]
+    fn loss_compensation_is_capped_by_min_ack_rate() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let now = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, now, 50, 50);
+        assert_eq!(brutal.pacing_rate(), Some(12_500_000));
+    }
+
+    #[test]
+    fn loss_compensation_needs_enough_samples() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let now = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, now, 20, 20);
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+    }
+
+    #[test]
+    fn loss_compensation_forgets_old_seconds() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let start = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, start, 90, 10);
+        assert_eq!(brutal.pacing_rate(), Some(11_111_111));
+
+        // Four seconds later the losses still count: 190 of 200 acknowledged.
+        exchange(&mut brutal, start + Duration::from_secs(4), 100, 0);
+        assert_eq!(brutal.pacing_rate(), Some(10_526_315));
+
+        // After five seconds their slot is reused.
+        exchange(&mut brutal, start + Duration::from_secs(5), 100, 0);
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+    }
+
+    #[test]
+    fn loss_compensation_forgets_old_seconds_without_new_samples() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let start = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, start, 90, 10);
+        assert_eq!(brutal.pacing_rate(), Some(11_111_111));
+
+        // Five seconds later, an ACK frame that acknowledges nothing new
+        // leaves the old slot in place, but it is out of the window.
+        exchange(&mut brutal, start + Duration::from_secs(5), 0, 0);
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+    }
+
+    #[test]
+    fn ecn_does_not_change_brutal() {
+        let mut brutal = brutal_80m(BrutalConfig::default());
+        let now = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, now, 100, 0);
+        brutal.on_congestion_event(now, now, false, true, 0);
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+        assert_eq!(brutal.window(), quinn_window(400_000));
+    }
+
+    #[test]
+    fn loss_compensation_can_be_disabled() {
+        let mut brutal = brutal_80m(BrutalConfig {
+            ack_compensate: false,
+            ..Default::default()
+        });
+        let now = brutal.epoch + Duration::from_secs(1);
+        exchange(&mut brutal, now, 50, 50);
+        assert_eq!(brutal.pacing_rate(), Some(10_000_000));
+        assert_eq!(brutal.window(), quinn_window(400_000));
     }
 
     #[test]
@@ -513,11 +723,41 @@ mod tests {
     #[test]
     fn brutal_rate_change_reaches_controller_through_clone() {
         let mut controller = controller(Some(10_000_000), None);
-        let initial = controller.window();
+        assert_eq!(controller.pacing_rate(), Some(1_250_000));
         snapshot(&*controller).set_send_mode(BrutalSendMode::Brutal(100_000_000));
 
         controller.on_sent(Instant::now(), 1200, 0);
-        assert_eq!(controller.window(), initial * 10);
+        assert_eq!(controller.pacing_rate(), Some(12_500_000));
+    }
+
+    #[test]
+    fn negotiated_rate_survives_path_change() {
+        // A server without `bandwidth` negotiates 40 Mbit/s, then the client
+        // moves to a new address that quinn does not treat as a NAT rebinding.
+        let mut controller = controller(None, None);
+        let negotiated = snapshot(&*controller);
+        negotiated.set_send_mode(BrutalSendMode::Brutal(40_000_000));
+        controller.on_sent(Instant::now(), 1200, 0);
+        let mut moved = controller.for_new_path(Instant::now(), 1300).unwrap();
+        assert_eq!(moved.pacing_rate(), Some(5_000_000));
+        assert_eq!(snapshot(&*moved).mtu, 1300);
+
+        // Later negotiation results still reach the controller of the new path.
+        negotiated.set_send_mode(BrutalSendMode::Brutal(80_000_000));
+        moved.on_sent(Instant::now(), 1200, 1);
+        assert_eq!(moved.pacing_rate(), Some(10_000_000));
+    }
+
+    #[test]
+    fn negotiated_base_survives_path_change() {
+        // A server with `bandwidth` that ignored the client's rate keeps its
+        // base controller on the new path instead of restarting Brutal.
+        let mut controller = controller(Some(10_000_000), None);
+        snapshot(&*controller).set_send_mode(BrutalSendMode::Base);
+        controller.on_sent(Instant::now(), 1200, 0);
+        let moved = controller.for_new_path(Instant::now(), MTU).unwrap();
+        assert_eq!(moved.pacing_rate(), None);
+        assert_eq!(snapshot(&*moved).brutal_rate(), None);
     }
 
     #[test]
@@ -528,10 +768,12 @@ mod tests {
         snapshot(&*controller).set_send_mode(BrutalSendMode::Brutal(50_000_000));
         controller.on_sent(Instant::now(), 1200, 0);
         assert_eq!(snapshot(&*controller).brutal_rate(), Some(50_000_000));
+        assert_eq!(controller.pacing_rate(), Some(6_250_000));
 
         snapshot(&*controller).set_send_mode(BrutalSendMode::Base);
         controller.on_sent(Instant::now(), 1200, 1);
         assert_eq!(snapshot(&*controller).brutal_rate(), None);
+        assert_eq!(controller.pacing_rate(), None);
         assert_eq!(controller.window(), base_window);
     }
 
